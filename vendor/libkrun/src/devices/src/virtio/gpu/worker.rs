@@ -95,6 +95,7 @@ impl Worker {
             self.mem.clone(),
             self.control_queue.clone(),
             self.interrupt.clone(),
+            self.map_sender.clone(),
             self.export_table.take(),
             self.displays.clone(),
             self.display_backend,
@@ -135,48 +136,7 @@ impl Worker {
     ) -> VirtioGpuResult {
         virtio_gpu.force_ctx_0();
 
-        let cmd_name = match &cmd {
-            GpuCommand::GetDisplayInfo => "GetDisplayInfo",
-            GpuCommand::GetEdid(_) => "GetEdid",
-            GpuCommand::ResourceCreate2d(_) => "ResourceCreate2d",
-            GpuCommand::ResourceUnref(_) => "ResourceUnref",
-            GpuCommand::SetScanout(_) => "SetScanout",
-            GpuCommand::SetScanoutBlob(_) => "SetScanoutBlob",
-            GpuCommand::ResourceFlush(_) => "ResourceFlush",
-            GpuCommand::TransferToHost2d(_) => "TransferToHost2d",
-            GpuCommand::ResourceAttachBacking(_) => "ResourceAttachBacking",
-            GpuCommand::ResourceDetachBacking(_) => "ResourceDetachBacking",
-            GpuCommand::GetCapsetInfo(_) => "GetCapsetInfo",
-            GpuCommand::GetCapset(_) => "GetCapset",
-            GpuCommand::CtxCreate(_) => "CtxCreate",
-            GpuCommand::CtxDestroy(_) => "CtxDestroy",
-            GpuCommand::CtxAttachResource(_) => "CtxAttachResource",
-            GpuCommand::CtxDetachResource(_) => "CtxDetachResource",
-            GpuCommand::ResourceCreate3d(_) => "ResourceCreate3d",
-            GpuCommand::TransferToHost3d(_) => "TransferToHost3d",
-            GpuCommand::TransferFromHost3d(_) => "TransferFromHost3d",
-            GpuCommand::CmdSubmit3d(_) => "CmdSubmit3d",
-            GpuCommand::ResourceCreateBlob(info) => {
-                eprintln!(
-                    "[capy-trace] ResourceCreateBlob resource_id={} blob_mem={} blob_flags={} size={} nr_entries={}",
-                    info.resource_id, info.blob_mem, info.blob_flags, info.size, info.nr_entries
-                );
-                "ResourceCreateBlob"
-            }
-            GpuCommand::ResourceMapBlob(info) => {
-                eprintln!(
-                    "[capy-trace] ResourceMapBlob resource_id={} offset={}",
-                    info.resource_id, info.offset
-                );
-                "ResourceMapBlob"
-            }
-            GpuCommand::ResourceUnmapBlob(_) => "ResourceUnmapBlob",
-            GpuCommand::UpdateCursor(_) => "UpdateCursor",
-            GpuCommand::MoveCursor(_) => "MoveCursor",
-            GpuCommand::ResourceAssignUuid(_) => "ResourceAssignUuid",
-        };
-        eprintln!("[capy-trace] cmd={cmd_name} ctx_id={}", hdr.ctx_id);
-        let result = match cmd {
+        match cmd {
             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
             GpuCommand::ResourceCreate2d(info) => {
@@ -396,9 +356,7 @@ impl Worker {
                 let resource_id = info.resource_id;
                 virtio_gpu.resource_unmap_blob(resource_id, &self.shm_region)
             }
-        };
-        eprintln!("[capy-trace] result={result:?}");
-        result
+        }
     }
 
     fn process_queue(

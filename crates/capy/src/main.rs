@@ -650,6 +650,15 @@ fn build_boot_contract(args: &Args) -> anyhow::Result<BootContract> {
             "androidboot.hardware.hwcomposer=ranchu".to_string(),
             "androidboot.hardware.vulkan=ranchu".to_string(),
             "androidboot.hardware.gltransport=virtio-gpu-pipe".to_string(),
+            // Cuttlefish lights HAL binds an AF_VSOCK listener on this port
+            // (VsockServer::new). With the property absent it defaults to port 0,
+            // which fails the bind with EACCES and panics, leaving the VINTF-declared
+            // android.hardware.light.ILights service unregistered -- LightsService in
+            // system_server then blocks in waitForDeclaredService until Watchdog kills
+            // it, crash-looping zygote and preventing sys.boot_completed. Any nonzero
+            // port lets the guest-side listener bind succeed (no host peer needed to
+            // register the service), so boot can complete.
+            "androidboot.vsock_lights_port=6800".to_string(),
             "androidboot.mode=normal".to_string(),
             format!("androidboot.bootmode={}", soc.bootmode),
             format!("androidboot.slot_suffix={}", soc.slot_suffix),

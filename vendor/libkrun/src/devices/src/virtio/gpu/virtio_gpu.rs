@@ -400,14 +400,18 @@ impl VirtioGpu {
 
     /// Variant of [`new`] for the macOS + gfxstream (Vulkan-only) path.
     ///
-    /// Does not need `virgl_flags` or a `map_sender`; creates the Rutabaga
-    /// instance via `create_rutabaga_gfxstream` and falls back to a headless
-    /// 2-D renderer if that fails.
+    /// Does not need `virgl_flags`; creates the Rutabaga instance via
+    /// `create_rutabaga_gfxstream` and falls back to a headless 2-D renderer if
+    /// that fails. The `map_sender` is required: gfxstream's ASG ring buffer is a
+    /// HOST3D blob that `resource_map_blob` maps into the guest via
+    /// `WorkerMessage::GpuAddMapping` (hv_vm_map), so the channel must be the live
+    /// one serviced by the vmm worker, not a disconnected stub.
     #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
     pub fn new_gfxstream(
         mem: GuestMemoryMmap,
         queue_ctl: Arc<Mutex<VirtQueue>>,
         interrupt: InterruptTransport,
+        map_sender: Sender<WorkerMessage>,
         export_table: Option<ExportTable>,
         displays: Box<[DisplayInfo]>,
         display_backend: DisplayBackend,
@@ -453,13 +457,7 @@ impl VirtioGpu {
             displays,
             display_backend,
             #[cfg(target_os = "macos")]
-            map_sender: {
-                // new_gfxstream does not need a map_sender (no Metal external
-                // memory import via virglrenderer); use an unbounded channel
-                // that satisfies the struct field but is never consumed.
-                let (tx, _rx) = unbounded();
-                tx
-            },
+            map_sender,
         }
     }
 
@@ -697,12 +695,23 @@ impl VirtioGpu {
     /// Can also be used to invalidate caches.
     pub fn transfer_read(
         &mut self,
-        _ctx_id: u32,
-        _resource_id: u32,
-        _transfer: Transfer3D,
-        _buf: Option<VolatileSlice>,
+        ctx_id: u32,
+        resource_id: u32,
+        transfer: Transfer3D,
+        buf: Option<VolatileSlice>,
     ) -> VirtioGpuResult {
-        panic!("virtio_gpu: transfer_read unimplemented");
+        // gfxstream's ASG ring relies on TRANSFER_FROM_HOST_3D to read host-produced
+        // data back (e.g. the ring's read pointer / response area). The control-queue
+        // call path passes `buf: None`, transferring into the resource's own backing;
+        // support an explicit destination slice too for completeness.
+        let buf = buf.map(|s| {
+            // SAFETY: the volatile slice points at a live, correctly-sized guest
+            // mapping for the duration of this call.
+            unsafe { IoSliceMut::new(std::slice::from_raw_parts_mut(s.ptr_guard_mut().as_ptr(), s.len())) }
+        });
+        self.rutabaga
+            .transfer_read(ctx_id, resource_id, transfer, buf)?;
+        Ok(OkNoData)
     }
 
     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
@@ -1013,71 +1022,50 @@ impl VirtioGpu {
             .get_mut(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
 
-        let map_info = match self.rutabaga.map_info(resource_id) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[capy-trace] resource_map_blob: map_info FAILED resource_id={resource_id} err={e:?}");
-                return Err(ErrUnspec);
-            }
-        };
-        let map_ptr = match self.rutabaga.map_ptr(resource_id) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("[capy-trace] resource_map_blob: map_ptr FAILED resource_id={resource_id} err={e:?}");
-                return Err(ErrUnspec);
-            }
-        };
+        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
+        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
 
-        match self.rutabaga.export_blob(resource_id) {
-            Ok(export) => {
-                eprintln!(
-                    "[capy-trace] resource_map_blob: export OK handle_type={} map_ptr={:x}",
-                    export.handle_type, map_ptr
-                );
+        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
+            debug!(
+                "resource_map_blob: export handle_type={} map_ptr={:x}",
+                export.handle_type, map_ptr
+            );
 
-                if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
-                    || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
-                {
-                    if offset + resource.size > shm_region.size as u64 {
-                        eprintln!(
-                            "[capy-trace] resource_map_blob: DOES NOT FIT offset={offset} size={} shm_region.size={}",
-                            resource.size, shm_region.size
-                        );
-                        return Err(ErrUnspec);
-                    }
-
-                    let guest_addr = shm_region.guest_addr + offset;
-                    eprintln!(
-                        "[capy-trace] resource_map_blob: mapping map_ptr={:x} guest_addr={:x} size={}",
-                        map_ptr, guest_addr, resource.size
-                    );
-
-                    let (reply_sender, reply_receiver) = unbounded();
-                    self.map_sender
-                        .send(WorkerMessage::GpuAddMapping(
-                            reply_sender,
-                            map_ptr,
-                            guest_addr,
-                            resource.size,
-                        ))
-                        .unwrap();
-                    let ok = reply_receiver.recv().unwrap();
-                    eprintln!("[capy-trace] resource_map_blob: GpuAddMapping reply={ok}");
-                    if !ok {
-                        return Err(ErrUnspec);
-                    }
-                } else {
-                    eprintln!(
-                        "[capy-trace] resource_map_blob: unsupported export handle_type={} for resource {}",
-                        export.handle_type, resource_id
-                    );
+            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
+                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
+            {
+                if offset + resource.size > shm_region.size as u64 {
+                    error!("mapping DOES NOT FIT");
                     return Err(ErrUnspec);
                 }
-            }
-            Err(e) => {
-                eprintln!("[capy-trace] resource_map_blob: export_blob FAILED resource_id={resource_id} err={e:?}");
+
+                let guest_addr = shm_region.guest_addr + offset;
+                debug!(
+                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
+                    map_ptr, guest_addr, resource.size
+                );
+
+                let (reply_sender, reply_receiver) = unbounded();
+                self.map_sender
+                    .send(WorkerMessage::GpuAddMapping(
+                        reply_sender,
+                        map_ptr,
+                        guest_addr,
+                        resource.size,
+                    ))
+                    .unwrap();
+                if !reply_receiver.recv().unwrap() {
+                    return Err(ErrUnspec);
+                }
+            } else {
+                error!(
+                    "resource_map_blob: unsupported export handle_type={} for resource {}",
+                    export.handle_type, resource_id
+                );
                 return Err(ErrUnspec);
             }
+        } else {
+            return Err(ErrUnspec);
         }
 
         resource.shmem_offset = Some(offset);
