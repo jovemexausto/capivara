@@ -1,0 +1,17 @@
+[package]
+name = "capy"
+version = "0.1.0"
+edition = "2021"
+description = "Capivara VM launcher — boots Android microVM via libkrun + gfxstream"
+
+[[bin]]
+name = "capy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow  = "1"
+clap    = { version = "4", features = ["derive"] }
+log     = "0.4"
+env_logger = "0.11"
+libc    = "0.2"
+

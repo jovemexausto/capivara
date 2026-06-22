@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/capy",
+    "vendor/libkrun/init",
+    "vendor/libkrun/src/libkrun",
+    "vendor/libkrun/src/init_blob",
+    "vendor/libkrun/src/input",
+    "vendor/libkrun/src/display",
+    "vendor/libkrun/src/utils",
+    "vendor/libkrun/src/arch_gen",
+    "vendor/libkrun/src/cpuid",
+    "vendor/libkrun/src/smbios",
+    "vendor/libkrun/src/polly",
+    "vendor/libkrun/src/kernel",
+    "vendor/libkrun/src/arch",
+    "vendor/libkrun/src/hvf",
+    "vendor/libkrun/src/devices",
+    "vendor/libkrun/src/vmm",
+    "vendor/libkrun/src/rutabaga_gfx",
+    "crates/lpprobe",
+]
+exclude = [
+    "vendor/libkrun/src/aws_nitro",
+    "vendor/libkrun/src/whp",
+    "vendor/libkrun/examples/gtk_display",
+]
+
+[workspace.package]
+authors = ["Capivara Contributors"]
+license = "Apache-2.0"
+edition = "2024"
+
+[profile.release]
+lto = true
+opt-level = 3
+strip = true
+
+[profile.dev]
+opt-level = 1

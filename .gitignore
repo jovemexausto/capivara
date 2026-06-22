@@ -1,0 +1,15 @@
+# Cargo
+target/
+Cargo.lock
+build/
+
+# gfxstream build
+vendor/gfxstream/build-macos/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
