@@ -185,6 +185,57 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
+/// Performs a gfxstream TRANSFER_FROM_HOST_3D directly against the global
+/// `stream_renderer_*` singleton, identified by `resource_id` alone.
+///
+/// gfxstream's pipe `TransferFromHost` is a BLOCKING, full-duplex read: it spins
+/// until the per-context RenderThread produces the requested bytes, which in turn
+/// requires the guest's matching writes (`TransferToHost`) to be serviced
+/// concurrently. The virtio-gpu dispatcher must therefore run this *without*
+/// holding any device lock, so a sibling worker can process the feeding writes;
+/// otherwise the single dispatch thread deadlocks against the RenderThread.
+///
+/// Because the underlying `stream_renderer_*` API is a process-global singleton
+/// (no renderer handle) and is internally thread-safe, this is safe to call from
+/// any thread with no `&mut` access to rutabaga state — only the `resource_id`
+/// and transfer geometry are needed (the destination iovecs are tracked
+/// host-side by resource id via ATTACH_BACKING).
+pub fn transfer_read_blocking_by_id(
+    resource_id: u32,
+    ctx_id: u32,
+    transfer: Transfer3D,
+) -> RutabagaResult<()> {
+    if transfer.is_empty() {
+        return Ok(());
+    }
+
+    let mut transfer_box = VirglBox {
+        x: transfer.x,
+        y: transfer.y,
+        z: transfer.z,
+        w: transfer.w,
+        h: transfer.h,
+        d: transfer.d,
+    };
+
+    // Safe: only stack variables of the appropriate type are used; null iovecs
+    // means "transfer into the resource's host-tracked backing" (buf == None).
+    let ret = unsafe {
+        stream_renderer_transfer_read_iov(
+            resource_id,
+            ctx_id,
+            transfer.level,
+            transfer.stride,
+            transfer.layer_stride,
+            &mut transfer_box as *mut VirglBox as *mut stream_renderer_box,
+            transfer.offset,
+            null_mut(),
+            0,
+        )
+    };
+    ret_to_res(ret)
+}
+
 /// The virtio-gpu backend state tracker which supports accelerated rendering.
 pub struct Gfxstream {
     /// Cookie used by Gfxstream, should be held as long as the renderer is alive.
