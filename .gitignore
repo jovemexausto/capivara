@@ -13,3 +13,5 @@ vendor/gfxstream/build-macos/
 .vscode/
 .idea/
 *.swp
+.opencode
+.claude

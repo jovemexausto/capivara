@@ -1,4 +1,4 @@
-![Capivara banner](assets/banner.png)
+![Capivara banner](branding/banner.png)
 
 Capivara faz apps Android se comportarem como apps nativos do macOS. Um APK instalado vira um `.app` de primeira classe, com Dock, Spotlight, `Cmd+Tab` e a experiência nativa do sistema.
 
