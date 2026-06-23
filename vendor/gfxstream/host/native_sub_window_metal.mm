@@ -46,6 +46,12 @@
 
 // Returns the CAMetalLayer backing the given NSView, or nil.
 // display_surface_vk.cpp calls this when VK_USE_PLATFORM_MACOS_MVK is defined.
+//
+// When the GLES decoder is also built, native_sub_window_cocoa.mm provides its
+// own getMetalLayerFromView() for the view type *it* creates
+// (EmuGLViewWithMetal); this version is for the EmuMetalView type created by
+// createSubWindow() below, which only exists in the Vulkan-only build.
+#if !GFXSTREAM_ENABLE_HOST_GLES
 extern "C" void* getMetalLayerFromView(void* view) {
     if (!view) return nullptr;
     NSView* nsView = (__bridge NSView*)view;
@@ -62,6 +68,7 @@ extern "C" void* getMetalLayerFromView(void* view) {
 
     return nullptr;
 }
+#endif  // !GFXSTREAM_ENABLE_HOST_GLES
 
 // createSubWindow / destroySubWindow / moveSubWindow for the vulkan-only path.
 // These are compiled here instead of native_sub_window_cocoa.mm to avoid

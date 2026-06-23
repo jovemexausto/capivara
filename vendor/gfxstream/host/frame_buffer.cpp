@@ -4054,14 +4054,11 @@ HandleType FrameBuffer::Impl::getEmulatedEglWindowSurfaceColorBufferHandle(Handl
 
     auto it = m_EmulatedEglWindowSurfaceToColorBuffer.find(p_surface);
     if (it == m_EmulatedEglWindowSurfaceToColorBuffer.end()) {
+        GFXSTREAM_ERROR("Failed to find EmulatedEglWindowSurface:%d", p_surface);
+        return 0;
+    }
     return it->second;
 }
-
-void FrameBuffer::Impl::setScreenMask(int width, int height, const uint8_t* rgbaData) {
-    m_compositor->setScreenMask(width, height, rgbaData);
-}
-
-
 
 #ifdef CONFIG_AEMU
 void FrameBuffer::Impl::registerVulkanInstance(uint64_t id, const char* appName) const {
@@ -4085,17 +4082,6 @@ void FrameBuffer::Impl::unregisterVulkanInstance(uint64_t id) const {
     get_gfxstream_vm_operations().unregister_vulkan_instance(id);
 }
 #endif
-
-void FrameBuffer::Impl::createTrivialContext(HandleType shared, HandleType* contextOut,
-                                             HandleType* surfOut) {
-    assert(contextOut);
-    assert(surfOut);
-
-    *contextOut = createEmulatedEglContext(0, shared, GLESApi_2);
-    // Zero size is formally allowed here, but SwiftShader doesn't like it and
-    // fails.
-    *surfOut = createEmulatedEglWindowSurface(0, 1, 1);
-}
 
 void FrameBuffer::Impl::createSharedTrivialContext(EGLContext* contextOut, EGLSurface* surfOut) {
     assert(contextOut);
@@ -5531,13 +5517,12 @@ void FrameBuffer::getNumConfigs(int* outNumConfigs, int* outNumAttribs) {
     mImpl->getNumConfigs(outNumConfigs, outNumAttribs);
 }
 
-EGLint FrameBuffer::chooseConfig(EGLint* attribs, EGLint* configs, EGLint configsSize) {
-    return mImpl->chooseConfig(attribs, configs, configsSize);
+EGLint FrameBuffer::getConfigs(uint32_t bufferSize, GLuint* buffer) {
+    return mImpl->getConfigs(bufferSize, buffer);
 }
 
-void FrameBuffer::getDeviceInfo(const char** vendor, const char** renderer,
-                               const char** version) const {
-    mImpl->getDeviceInfo(vendor, renderer, version);
+EGLint FrameBuffer::chooseConfig(EGLint* attribs, EGLint* configs, EGLint configsSize) {
+    return mImpl->chooseConfig(attribs, configs, configsSize);
 }
 
 HandleType FrameBuffer::createEmulatedEglContext(int p_config, HandleType p_share,

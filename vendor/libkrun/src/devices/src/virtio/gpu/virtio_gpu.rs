@@ -317,9 +317,19 @@ impl VirtioGpu {
         display_width: u32,
         display_height: u32,
     ) -> Option<Rutabaga> {
-        // Vulkan-only: configure via RutabagaBuilder fluent API.
-        // GFXSTREAM_ENABLE_HOST_GLES=0 means EGL/GLES are unavailable;
-        // use_vulkan(true) is the only meaningful flag here.
+        // Vulkan + GLES (composer3's renderControl path needs a real GLES
+        // decoder on the host; gfxstream is built with -Ddecoders=vulkan,gles).
+        //
+        // use_egl(false) is deliberate even though GLES is enabled:
+        // STREAM_RENDERER_FLAGS_USE_EGL_BIT maps to gfxstream's `EglOnEgl`
+        // feature, which routes the GLES translator through `egl_os_api_egl.cpp`
+        // -- a passthrough that dlopen()s a host libEGL.so/libGLESv2.so. Those
+        // don't exist on macOS (no native EGL). With EglOnEgl off,
+        // EglGlobalInfo picks the native Darwin backend instead
+        // (egl_os_api_darwin.cpp's `Engine::createHostInstance()`, built on
+        // mac_native.m's direct NSOpenGL/CGL calls) -- the one this platform
+        // actually has. `use_gles(true)` is unaffected by this and still
+        // enables the GLES decoder/capset.
         let builder = RutabagaBuilder::new(
             rutabaga_gfx::RutabagaComponentType::Gfxstream,
             0, // virgl_flags — unused by gfxstream component
@@ -328,7 +338,7 @@ impl VirtioGpu {
         .set_display_width(display_width)
         .set_display_height(display_height)
         .set_use_egl(false)
-        .set_use_gles(false)
+        .set_use_gles(true)
         .set_use_glx(false)
         .set_use_surfaceless(false)
         .set_use_vulkan(true)
