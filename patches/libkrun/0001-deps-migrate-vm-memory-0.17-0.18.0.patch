@@ -1,7 +1,7 @@
 From 5fc25acd0365ce9915cfea26985e1ee99dca461f Mon Sep 17 00:00:00 2001
 From: Marcus Figueiredo <figueiredo@protonmail.com>
 Date: Tue, 23 Jun 2026 16:52:54 -0300
-Subject: [PATCH] deps: migrate vm-memory 0.17 -> 0.18.0
+Subject: [PATCH 1/7] deps: migrate vm-memory 0.17 -> 0.18.0
 
 Unifies the workspace on vm-memory 0.18.0 (required by the gfxstream
 scaffolding, which uses GuestMemoryBackend). In 0.18, GuestMemory's

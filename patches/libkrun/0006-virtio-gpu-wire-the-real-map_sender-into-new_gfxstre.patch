@@ -1,7 +1,7 @@
-From c716dcb517079360c303ccecac2cd1dd5e071538 Mon Sep 17 00:00:00 2001
+From b4e4e99574c4a7131f4efe4bdb4bbd42a10e6c32 Mon Sep 17 00:00:00 2001
 From: Marcus Figueiredo <figueiredo@protonmail.com>
 Date: Tue, 23 Jun 2026 16:31:57 -0300
-Subject: [PATCH 5/6] virtio/gpu: wire the real map_sender into new_gfxstream
+Subject: [PATCH 6/7] virtio/gpu: wire the real map_sender into new_gfxstream
  on macOS
 
 new_gfxstream constructed a throwaway channel for map_sender (receiver

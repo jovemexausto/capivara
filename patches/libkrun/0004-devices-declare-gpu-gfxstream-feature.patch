@@ -1,7 +1,7 @@
-From cce18869fd7c2fb2249b383a9ebc3cc57018431b Mon Sep 17 00:00:00 2001
+From b0ecdf5ed22aa34d8052b51c25e836351eee545f Mon Sep 17 00:00:00 2001
 From: Marcus Figueiredo <figueiredo@protonmail.com>
 Date: Tue, 23 Jun 2026 16:22:29 -0300
-Subject: [PATCH 3/6] devices: declare gpu-gfxstream feature
+Subject: [PATCH 4/7] devices: declare gpu-gfxstream feature
 
 The macOS+gfxstream cfg gate (#[cfg(all(target_os = "macos", feature =
 "gpu-gfxstream"))], used throughout virtio_gpu.rs/worker.rs) needs this
@@ -14,7 +14,7 @@ for rutabaga_gfx (currently only re-declared with ["x"] on linux, ["virgl_render
  1 file changed, 1 insertion(+)
 
 diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
-index fe8e4f3..0c525b0 100644
+index a05a516..c4152cf 100644
 --- a/src/devices/Cargo.toml
 +++ b/src/devices/Cargo.toml
 @@ -15,6 +15,7 @@ tdx = ["blk", "tee"]

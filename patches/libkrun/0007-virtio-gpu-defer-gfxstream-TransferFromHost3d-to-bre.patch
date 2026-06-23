@@ -1,8 +1,8 @@
-From 96e1feaaa0fccb5f68e52b1033a7a2417406e41e Mon Sep 17 00:00:00 2001
+From 016bb0d45c67c7d7f0e26d2e374e1b9512b982a6 Mon Sep 17 00:00:00 2001
 From: Marcus Figueiredo <figueiredo@protonmail.com>
-Date: Tue, 23 Jun 2026 11:11:03 -0300
-Subject: [PATCH] gpu: defer gfxstream TransferFromHost3d to break dispatcher
- deadlock
+Date: Tue, 23 Jun 2026 16:33:51 -0300
+Subject: [PATCH 7/7] virtio/gpu: defer gfxstream TransferFromHost3d to break
+ dispatcher deadlock
 
 gfxstream's pipe TransferFromHost is a blocking, full-duplex read: it spins
 until the per-context RenderThread on the host produces the requested
@@ -29,31 +29,16 @@ EventFd::read (not blocked) while a "gpu xfer" helper blocks on the
 transfer, and DRM_IOCTL_VIRTGPU_WAIT EBUSY spinning drops to zero.
 RenderEngine now reliably reaches GaneshVkRenderEngine::create, unlike
 before this fix where it depended on lucky command interleaving timing.
-
-Separately diagnosed (not yet fixed): boot still doesn't complete
-end-to-end because the composer3 HAL's HWC3 implementation calls into the
-legacy renderControl/GLES HostConnection path (libOpenglSystemCommon ->
-lib_renderControl_enc.so), which requires a GLES-capable gfxstream host
-backend. Our libgfxstream_backend.dylib is built Vulkan-only
-(`-Ddecoders=vulkan`, GFXSTREAM_ENABLE_HOST_GLES=0), so that RPC never
-gets a response -- this is now a request waiting on a response that will
-never arrive, not a contention issue, and is unrelated to this fix.
-Confirmed via binary diffing that the stock AOSP Cuttlefish image already
-ships this composer3/renderControl dependency baked in at link time, so
-this isn't a problem with our guest image. The path forward is the host
-gfxstream build, not anything in libkrun's dispatcher.
-
-Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
 ---
- .../src/devices/src/virtio/gpu/worker.rs      | 317 +++++++++++++++++-
- .../libkrun/src/rutabaga_gfx/src/gfxstream.rs |  51 +++
- vendor/libkrun/src/rutabaga_gfx/src/lib.rs    |   2 +
- 3 files changed, 365 insertions(+), 5 deletions(-)
+ src/devices/src/virtio/gpu/worker.rs | 318 ++++++++++++++++++++++++++-
+ src/rutabaga_gfx/src/gfxstream.rs    |  51 +++++
+ src/rutabaga_gfx/src/lib.rs          |   2 +
+ 3 files changed, 365 insertions(+), 6 deletions(-)
 
-diff --git a/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs b/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs
-index 109d7a1..6733f60 100644
---- a/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs
-+++ b/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs
+diff --git a/src/devices/src/virtio/gpu/worker.rs b/src/devices/src/virtio/gpu/worker.rs
+index df0bc0e..6733f60 100644
+--- a/src/devices/src/virtio/gpu/worker.rs
++++ b/src/devices/src/virtio/gpu/worker.rs
 @@ -17,6 +17,8 @@ use utils::worker_message::WorkerMessage;
  use vm_memory::{GuestAddress, GuestMemoryMmap};
  
@@ -132,15 +117,16 @@ index 109d7a1..6733f60 100644
          let mut virtio_gpu = VirtioGpu::new(
              self.mem.clone(),
              self.control_queue.clone(),
-@@ -359,6 +398,7 @@ impl Worker {
+@@ -359,7 +398,7 @@ impl Worker {
          }
      }
  
+-
 +    #[cfg(not(all(target_os = "macos", feature = "gpu-gfxstream")))]
      fn process_queue(
          &mut self,
          virtio_gpu: &mut VirtioGpu,
-@@ -466,4 +506,271 @@ impl Worker {
+@@ -467,4 +506,271 @@ impl Worker {
          debug!("gpu: process_queue exit");
          used_any
      }
@@ -412,10 +398,10 @@ index 109d7a1..6733f60 100644
 +        }
 +    }
  }
-diff --git a/vendor/libkrun/src/rutabaga_gfx/src/gfxstream.rs b/vendor/libkrun/src/rutabaga_gfx/src/gfxstream.rs
+diff --git a/src/rutabaga_gfx/src/gfxstream.rs b/src/rutabaga_gfx/src/gfxstream.rs
 index 40b92c4..8268bf5 100644
---- a/vendor/libkrun/src/rutabaga_gfx/src/gfxstream.rs
-+++ b/vendor/libkrun/src/rutabaga_gfx/src/gfxstream.rs
+--- a/src/rutabaga_gfx/src/gfxstream.rs
++++ b/src/rutabaga_gfx/src/gfxstream.rs
 @@ -185,6 +185,57 @@ unsafe extern "C" {
      ) -> c_int;
  }
@@ -474,10 +460,10 @@ index 40b92c4..8268bf5 100644
  /// The virtio-gpu backend state tracker which supports accelerated rendering.
  pub struct Gfxstream {
      /// Cookie used by Gfxstream, should be held as long as the renderer is alive.
-diff --git a/vendor/libkrun/src/rutabaga_gfx/src/lib.rs b/vendor/libkrun/src/rutabaga_gfx/src/lib.rs
+diff --git a/src/rutabaga_gfx/src/lib.rs b/src/rutabaga_gfx/src/lib.rs
 index 6f03ea4..517e14e 100644
---- a/vendor/libkrun/src/rutabaga_gfx/src/lib.rs
-+++ b/vendor/libkrun/src/rutabaga_gfx/src/lib.rs
+--- a/src/rutabaga_gfx/src/lib.rs
++++ b/src/rutabaga_gfx/src/lib.rs
 @@ -21,6 +21,8 @@ mod rutabaga_snapshot;
  mod rutabaga_utils;
  mod virgl_renderer;

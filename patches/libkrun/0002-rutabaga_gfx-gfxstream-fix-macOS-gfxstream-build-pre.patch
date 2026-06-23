@@ -1,7 +1,7 @@
-From 40bc483944644314b045f3f271ca13fc62272f6f Mon Sep 17 00:00:00 2001
+From bcc2c52cda866ccbc19d9808660709f3dc03d76d Mon Sep 17 00:00:00 2001
 From: Marcus Figueiredo <figueiredo@protonmail.com>
 Date: Tue, 23 Jun 2026 16:18:29 -0300
-Subject: [PATCH 1/6] rutabaga_gfx/gfxstream: fix macOS+gfxstream build
+Subject: [PATCH 2/7] rutabaga_gfx/gfxstream: fix macOS+gfxstream build
  (pre-existing, unrelated to our work)
 
 `cargo check -p krun-rutabaga-gfx --features gfxstream` does not currently
