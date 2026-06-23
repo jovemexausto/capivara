@@ -1,0 +1,777 @@
+From 36a63c5f8b3018793ddcf4e96aede35e6ea556a4 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 17:07:59 -0300
+Subject: [PATCH 3/5] host: add Metal-backed Vulkan-only build support for
+ macOS
+
+Introduces the macOS/darwin build target: a CAMetalLayer-based native
+sub-window (native_sub_window_metal.mm, replacing the deprecated
+NSOpenGL/cocoa path for the Vulkan-only configuration), the darwin
+framework/link-args block in meson.build (CoreFoundation, IOKit,
+AppKit, Foundation, Metal, QuartzCore), and GFXSTREAM_ENABLE_HOST_GLES
+guards across frame_buffer.cpp/color_buffer.cpp/gles_compat.h so the
+GL-emulation-only code paths compile out cleanly when only the Vulkan
+decoder is enabled. Also adds stub backends (iostream, snapshot) for
+build configurations that don't need those subsystems on this
+platform.
+
+This is what first made gfxstream buildable for macOS/HVF at all,
+predating the gpu-gfxstream session work in libkrun. Hand-extracted by
+diffing the vendored gfxstream tree (with the two later GLES-decoder
+patches reverse-applied) against this branch.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>
+---
+ common/base/meson.build              |  11 +++
+ host/GlesCompat.h                    |   4 +
+ host/color_buffer.cpp                |  26 ++++++
+ host/frame_buffer.cpp                | 104 +++++++++++++---------
+ host/gles_compat.h                   |  30 +++++--
+ host/iostream/iostream_stub.cpp      |   1 +
+ host/iostream/meson.build            |   7 +-
+ host/meson.build                     |  25 +++++-
+ host/native_sub_window_metal.mm      | 125 +++++++++++++++++++++++++++
+ host/native_sub_window_stub.cpp      |   2 +
+ host/snapshot/meson.build            |   4 +
+ host/snapshot/snapshot_stub.cpp      |   1 +
+ host/vulkan/vk_common_operations.cpp |  18 +---
+ meson.build                          |   8 +-
+ 14 files changed, 300 insertions(+), 66 deletions(-)
+ create mode 100644 host/GlesCompat.h
+ create mode 100644 host/iostream/iostream_stub.cpp
+ create mode 100644 host/native_sub_window_metal.mm
+ create mode 100644 host/snapshot/snapshot_stub.cpp
+
+diff --git a/common/base/meson.build b/common/base/meson.build
+index 49589fd31..8529a1b52 100644
+--- a/common/base/meson.build
++++ b/common/base/meson.build
+@@ -32,6 +32,17 @@ else
+   files_lib_common_base += 'Thread_pthread.cpp'
+ endif
+ 
++if host_machine.system() == 'darwin'
++  # cpuUsageCurrentThread_macImpl and other macOS-specific utilities
++  files_lib_common_base += files('system-native-mac.mm')
++endif
++
++common_base_deps += [
++  dependency('appleframeworks',
++             modules: ['Foundation', 'IOKit', 'AppKit', 'CoreFoundation'],
++             required: host_machine.system() == 'darwin'),
++]
++
+ lib_common_base = static_library(
+   'common_base',
+   files_lib_common_base,
+diff --git a/host/GlesCompat.h b/host/GlesCompat.h
+new file mode 100644
+index 000000000..6947021a0
+--- /dev/null
++++ b/host/GlesCompat.h
+@@ -0,0 +1,4 @@
++// Case-insensitive alias: native_sub_window.h includes "GlesCompat.h"
++// but the file is named gles_compat.h. On case-sensitive filesystems
++// (APFS default on macOS) this causes a fatal error.
++#include "gles_compat.h"
+diff --git a/host/color_buffer.cpp b/host/color_buffer.cpp
+index 2733c4a6e..a041d9f6e 100644
+--- a/host/color_buffer.cpp
++++ b/host/color_buffer.cpp
+@@ -27,7 +27,9 @@ namespace gfxstream {
+ namespace host {
+ namespace {
+ 
++#if GFXSTREAM_ENABLE_HOST_GLES
+ using gl::ColorBufferGl;
++#endif
+ using vk::ColorBufferVk;
+ 
+ // ColorBufferVk natively supports YUV images. However, ColorBufferGl
+@@ -158,7 +160,11 @@ std::unique_ptr<ColorBuffer::Impl> ColorBuffer::Impl::create(
+ #endif
+ 
+     if (emulationVk) {
++#if GFXSTREAM_ENABLE_HOST_GLES
+         const bool vulkanOnly = colorBuffer->mColorBufferGl == nullptr;
++#else
++        const bool vulkanOnly = true;  // Capivara: no GL emulation
++#endif
+         const uint32_t memoryProperty = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+         const uint32_t mipLevels = 1;
+         colorBuffer->mColorBufferVk = vk::ColorBufferVk::create(
+@@ -392,6 +398,9 @@ std::unique_ptr<BorrowedImageInfo> ColorBuffer::Impl::borrowForDisplay(UsedApi a
+ }
+ 
+ bool ColorBuffer::Impl::flushFromGl() {
++#if !GFXSTREAM_ENABLE_HOST_GLES
++    return true;  // Capivara: no GL emulation
++#else
+     if (!(mColorBufferGl && mColorBufferVk)) {
+         return true;
+     }
+@@ -404,9 +413,13 @@ bool ColorBuffer::Impl::flushFromGl() {
+     // the "main"  should be updated from the current contents of the GL backing.
+     mGlTexDirty = true;
+     return true;
++#endif  // !GFXSTREAM_ENABLE_HOST_GLES
+ }
+ 
+ bool ColorBuffer::Impl::flushFromVk() {
++#if !GFXSTREAM_ENABLE_HOST_GLES
++    return true;  // Capivara: no GL emulation
++#else
+     if (!(mColorBufferGl && mColorBufferVk)) {
+         return true;
+     }
+@@ -432,9 +445,13 @@ bool ColorBuffer::Impl::flushFromVk() {
+ #endif
+     mGlTexDirty = false;
+     return true;
++#endif  // !GFXSTREAM_ENABLE_HOST_GLES
+ }
+ 
+ bool ColorBuffer::Impl::flushFromVkBytes(const void* bytes, size_t bytesSize) {
++#if !GFXSTREAM_ENABLE_HOST_GLES
++    return true;  // Capivara: no GL emulation
++#else
+     if (!(mColorBufferGl && mColorBufferVk)) {
+         return true;
+     }
+@@ -453,9 +470,13 @@ bool ColorBuffer::Impl::flushFromVkBytes(const void* bytes, size_t bytesSize) {
+ #endif
+     mGlTexDirty = false;
+     return true;
++#endif  // !GFXSTREAM_ENABLE_HOST_GLES
+ }
+ 
+ bool ColorBuffer::Impl::invalidateForGl() {
++#if !GFXSTREAM_ENABLE_HOST_GLES
++    return true;  // Capivara: no GL emulation
++#else
+     if (!(mColorBufferGl && mColorBufferVk)) {
+         return true;
+     }
+@@ -467,9 +488,13 @@ bool ColorBuffer::Impl::invalidateForGl() {
+     // ColorBufferGl is currently considered the "main" backing. If this changes,
+     // the GL backing should be updated from the "main" backing.
+     return true;
++#endif  // !GFXSTREAM_ENABLE_HOST_GLES
+ }
+ 
+ bool ColorBuffer::Impl::invalidateForVk() {
++#if !GFXSTREAM_ENABLE_HOST_GLES
++    return true;  // Capivara: no GL emulation
++#else
+     if (!(mColorBufferGl && mColorBufferVk)) {
+         return true;
+     }
+@@ -496,6 +521,7 @@ bool ColorBuffer::Impl::invalidateForVk() {
+ #endif
+     mGlTexDirty = false;
+     return true;
++#endif  // !GFXSTREAM_ENABLE_HOST_GLES
+ }
+ 
+ std::optional<BlobDescriptorInfo> ColorBuffer::Impl::exportBlob() {
+diff --git a/host/frame_buffer.cpp b/host/frame_buffer.cpp
+index c75beb9f4..587cac22e 100644
+--- a/host/frame_buffer.cpp
++++ b/host/frame_buffer.cpp
+@@ -56,6 +56,7 @@
+ #include "gfxstream/host/window_operations.h"
+ #include "gfxstream/synchronization/Lock.h"
+ #include "gfxstream/system/System.h"
++#include "readback_worker.h"
+ #include "render-utils/MediaNative.h"
+ #include "vulkan/display_vk.h"
+ #include "vulkan/post_worker_vk.h"
+@@ -669,13 +670,6 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
+     void postLoadRenderThreadContextSurfacePtrs();
+ 
+     gl::EmulationGl& getEmulationGl();
+-    bool hasEmulationGl() const { return m_emulationGl != nullptr; }
+-
+-    vk::VkEmulation& getEmulationVk();
+-    bool hasEmulationVk() const { return m_emulationVk != nullptr; }
+-
+-    bool setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode);
+-    int32_t mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, uint64_t size);
+ 
+     // Return the host EGLDisplay used by this instance.
+     EGLDisplay getDisplay() const;
+@@ -763,6 +757,13 @@ class FrameBuffer::Impl : public gfxstream::base::EventNotificationSupport<Frame
+     const gl::GLESv2Dispatch* getGles2Dispatch();
+ #endif
+ 
++    // These are non-GL-specific
++    vk::VkEmulation& getEmulationVk();
++    bool hasEmulationGl() const { return m_emulationGl != nullptr; }
++    bool hasEmulationVk() const { return m_emulationVk != nullptr; }
++    bool setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode);
++    int32_t mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, uint64_t size);
++
+     // Retrieve the vendor info strings for the GPU driver used for the emulation.
+     // On return, |*vendor|, |*renderer| and |*version| will point to strings
+     // that are owned by the instance (and must not be freed by the caller).
+@@ -2072,9 +2073,11 @@ HandleType FrameBuffer::Impl::genHandle_locked() {
+ 
+ bool FrameBuffer::Impl::isFormatSupported(GfxstreamFormat format) {
+     bool supported = true;
++#if GFXSTREAM_ENABLE_HOST_GLES
+     if (m_emulationGl) {
+         supported &= m_emulationGl->isFormatSupported(format);
+     }
++#endif
+     if (m_emulationVk) {
+         supported &= m_emulationVk->isFormatSupported(format);
+     }
+@@ -2461,8 +2464,8 @@ void FrameBuffer::Impl::cleanupProcGLObjects(uint64_t puid) {
+ std::vector<HandleType> FrameBuffer::Impl::cleanupProcGLObjects_locked(uint64_t puid, bool forced) {
+     std::vector<HandleType> colorBuffersToCleanup;
+     {
+-        std::unique_ptr<RecursiveScopedContextBind> bind = nullptr;
+-#if GFXSTREAM_ENABLE_HOST_GLES
++    #if GFXSTREAM_ENABLE_HOST_GLES
++    std::unique_ptr<RecursiveScopedContextBind> bind = nullptr;
+         if (m_emulationGl) {
+             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
+         }
+@@ -3239,8 +3242,8 @@ void FrameBuffer::Impl::onSave(Stream* stream, const ITextureSaverPtr& textureSa
+     //     m_prevDrawSurf
+     AutoLock mutex(m_lock);
+ 
+-    std::unique_ptr<RecursiveScopedContextBind> bind;
+ #if GFXSTREAM_ENABLE_HOST_GLES
++    std::unique_ptr<RecursiveScopedContextBind> bind;
+     if (m_emulationGl) {
+         // Some snapshot commands try using GL.
+         bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
+@@ -3367,8 +3370,8 @@ bool FrameBuffer::Impl::onLoad(Stream* stream, const ITextureLoaderPtr& textureL
+     {
+         sweepColorBuffersLocked();
+ 
+-        std::unique_ptr<RecursiveScopedContextBind> bind;
+ #if GFXSTREAM_ENABLE_HOST_GLES
++        std::unique_ptr<RecursiveScopedContextBind> bind;
+         if (m_emulationGl) {
+             // Some snapshot commands try using GL.
+             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
+@@ -3592,8 +3595,8 @@ bool FrameBuffer::Impl::onLoad(Stream* stream, const ITextureLoaderPtr& textureL
+ #endif
+ 
+     {
+-        std::unique_ptr<RecursiveScopedContextBind> bind;
+ #if GFXSTREAM_ENABLE_HOST_GLES
++        std::unique_ptr<RecursiveScopedContextBind> bind;
+         if (m_emulationGl) {
+             // Some snapshot commands try using GL.
+             bind = std::make_unique<RecursiveScopedContextBind>(getPbufferSurfaceContextHelper());
+@@ -3960,6 +3963,24 @@ std::optional<BlobDescriptorInfo> FrameBuffer::Impl::exportBuffer(HandleType buf
+     return buffer->exportBlob();
+ }
+ 
++
++#if GFXSTREAM_ENABLE_HOST_GLES
++void FrameBuffer::Impl::createTrivialContext(HandleType shared, HandleType* contextOut,
++                                             HandleType* surfOut) {
++    assert(contextOut);
++    assert(surfOut);
++
++    *contextOut = createEmulatedEglContext(0, shared, GLESApi_2);
++    *surfOut = createEmulatedEglWindowSurface(0, 1, 1);
++}
++#else
++void FrameBuffer::Impl::createTrivialContext(HandleType shared, HandleType* contextOut,
++                                             HandleType* surfOut) {
++    if (contextOut) *contextOut = 0;
++    if (surfOut) *surfOut = 0;
++}
++#endif
++
+ bool FrameBuffer::Impl::setColorBufferVulkanMode(HandleType colorBufferHandle, uint32_t mode) {
+     if (!m_emulationVk) {
+         GFXSTREAM_FATAL("VK emulation not enabled.");
+@@ -3979,22 +4000,17 @@ int32_t FrameBuffer::Impl::mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t
+     return m_emulationVk->mapGpaToBufferHandle(bufferHandle, gpa, size);
+ }
+ 
+-#if GFXSTREAM_ENABLE_HOST_GLES
+-HandleType FrameBuffer::Impl::getEmulatedEglWindowSurfaceColorBufferHandle(HandleType p_surface) {
+-    AutoLock mutex(m_lock);
+-
+-    auto it = m_EmulatedEglWindowSurfaceToColorBuffer.find(p_surface);
+-    if (it == m_EmulatedEglWindowSurfaceToColorBuffer.end()) {
+-        return 0;
+-    }
+-
+-    return it->second;
+-}
+ 
+ void FrameBuffer::Impl::setScreenMask(int width, int height, const uint8_t* rgbaData) {
+     m_compositor->setScreenMask(width, height, rgbaData);
+ }
+ 
++void FrameBuffer::Impl::setDisplayLayout(int screenWidth, int screenHeight,
++                                         const Rect& displayRect) {
++    AutoLock mutex(m_lock);
++    m_compositor->setDisplayLayout(screenWidth, screenHeight, displayRect);
++}
++
+ void FrameBuffer::Impl::setScreenBackground(int width, int height, const uint8_t* rgbaData) {
+     // Avoid processing the call before initializing or after finalizing the framebuffer
+     if (!sInitialized.load(std::memory_order_relaxed)) {
+@@ -4032,13 +4048,21 @@ void FrameBuffer::Impl::setScreenBackground(int width, int height, const uint8_t
+         }
+     }
+ }
+-
+-void FrameBuffer::Impl::setDisplayLayout(int screenWidth, int screenHeight,
+-                                         const Rect& displayRect) {
++#if GFXSTREAM_ENABLE_HOST_GLES
++HandleType FrameBuffer::Impl::getEmulatedEglWindowSurfaceColorBufferHandle(HandleType p_surface) {
+     AutoLock mutex(m_lock);
+-    m_compositor->setDisplayLayout(screenWidth, screenHeight, displayRect);
++
++    auto it = m_EmulatedEglWindowSurfaceToColorBuffer.find(p_surface);
++    if (it == m_EmulatedEglWindowSurfaceToColorBuffer.end()) {
++    return it->second;
+ }
+ 
++void FrameBuffer::Impl::setScreenMask(int width, int height, const uint8_t* rgbaData) {
++    m_compositor->setScreenMask(width, height, rgbaData);
++}
++
++
++
+ #ifdef CONFIG_AEMU
+ void FrameBuffer::Impl::registerVulkanInstance(uint64_t id, const char* appName) const {
+     auto* tInfo = RenderThreadInfo::get();
+@@ -5456,6 +5480,20 @@ int32_t FrameBuffer::mapGpaToBufferHandle(uint32_t bufferHandle, uint64_t gpa, u
+     return mImpl->mapGpaToBufferHandle(bufferHandle, gpa, size);
+ }
+ 
++
++void FrameBuffer::getDeviceInfo(const char** vendor, const char** renderer,
++                               const char** version) const {
++    mImpl->getDeviceInfo(vendor, renderer, version);
++}
++
++bool FrameBuffer::getVulkanEmulationDeviceInfo(char** device_name, char** driver_info,
++                                               uint32_t* driver_version, uint32_t* api_version,
++                                               uint32_t* vendor_id, uint32_t* device_id,
++                                               uint32_t* device_type, uint64_t* device_memory) {
++    return mImpl->getVulkanEmulationDeviceInfo(device_name, driver_info, driver_version,
++                                               api_version, vendor_id, device_id, device_type,
++                                               device_memory);
++}
+ #if GFXSTREAM_ENABLE_HOST_GLES
+ 
+ HandleType FrameBuffer::getEmulatedEglWindowSurfaceColorBufferHandle(HandleType p_surface) {
+@@ -5493,10 +5531,6 @@ void FrameBuffer::getNumConfigs(int* outNumConfigs, int* outNumAttribs) {
+     mImpl->getNumConfigs(outNumConfigs, outNumAttribs);
+ }
+ 
+-EGLint FrameBuffer::getConfigs(uint32_t bufferSize, GLuint* buffer) {
+-    return mImpl->getConfigs(bufferSize, buffer);
+-}
+-
+ EGLint FrameBuffer::chooseConfig(EGLint* attribs, EGLint* configs, EGLint configsSize) {
+     return mImpl->chooseConfig(attribs, configs, configsSize);
+ }
+@@ -5618,14 +5652,6 @@ void FrameBuffer::updateYUVTextures(uint32_t type, uint32_t* textures, void* pri
+     mImpl->updateYUVTextures(type, textures, privData, func);
+ }
+ 
+-bool FrameBuffer::getVulkanEmulationDeviceInfo(char** device_name, char** driver_info,
+-                                               uint32_t* driver_version, uint32_t* api_version,
+-                                               uint32_t* vendor_id, uint32_t* device_id,
+-                                               uint32_t* device_type, uint64_t* device_memory) {
+-    return mImpl->getVulkanEmulationDeviceInfo(device_name, driver_info, driver_version,
+-                                               api_version, vendor_id, device_id, device_type,
+-                                               device_memory);
+-}
+ 
+ void FrameBuffer::swapTexturesAndUpdateColorBuffer(uint32_t colorBufferHandle, int x, int y,
+                                                    int width, int height, uint32_t format,
+diff --git a/host/gles_compat.h b/host/gles_compat.h
+index f1f56dc66..ee533bb71 100644
+--- a/host/gles_compat.h
++++ b/host/gles_compat.h
+@@ -12,26 +12,42 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++// When GFXSTREAM_ENABLE_HOST_GLES=0 this file replaces <GLES2/gl2.h>
++// and <EGL/egl.h>. frame_buffer.cpp and color_buffer.cpp still reference
++// GL enumerants unconditionally, so we pull them from the bundled headers
++// in third_party/opengl/include — no system OpenGL library is needed.
+ #ifndef GLES_COMPAT_H
+ #define GLES_COMPAT_H
+ 
+ #include <cstdint>
+ 
+-typedef unsigned int GLenum;
+-typedef int32_t EGLint;
+-typedef unsigned int EGLNativeWindowType;
++// Bundled GL/EGL headers (no link-time dependency)
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
++#include <GLES3/gl3.h>  // GL_RGB8, GL_RGBA8, GL_R8, etc. are GLES3
++#include <EGL/egl.h>
++#include <EGL/eglext.h>
+ 
++// GL_BGR10_A2_ANGLEX is an ANGLE-private extension not in standard headers
++#ifndef GL_BGR10_A2_ANGLEX
++#define GL_BGR10_A2_ANGLEX 0x6AF9
++#endif
++
++// Forward-declare ColorBufferGl so that color_buffer.cpp compiles when
++// GFXSTREAM_ENABLE_HOST_GLES=0.  All uses of mColorBufferGl are already
++// guarded by #if GFXSTREAM_ENABLE_HOST_GLES; this declaration satisfies
++// the compiler for the nullptr guards.
+ namespace gfxstream {
++namespace host {
+ namespace gl {
++class ColorBufferGl;
+ class EmulationGl {
+    public:
+     EmulationGl() {}
+     ~EmulationGl() {}
+-
+-   private:
+-    uint32_t payload;
+ };
+ }  // namespace gl
++}  // namespace host
+ }  // namespace gfxstream
+ 
+-#endif
++#endif  // GLES_COMPAT_H
+diff --git a/host/iostream/iostream_stub.cpp b/host/iostream/iostream_stub.cpp
+new file mode 100644
+index 000000000..7f0353a06
+--- /dev/null
++++ b/host/iostream/iostream_stub.cpp
+@@ -0,0 +1 @@
++// macOS stub: ar requires at least one object file per static archive.
+diff --git a/host/iostream/meson.build b/host/iostream/meson.build
+index b407ca89a..9338bca7d 100644
+--- a/host/iostream/meson.build
++++ b/host/iostream/meson.build
+@@ -3,8 +3,11 @@
+ 
+ inc_host_iostream = include_directories('include')
+ 
+-files_lib_host_iostream = files(
+-)
++files_lib_host_iostream = files()
++if host_machine.system() == 'darwin'
++  # macOS ar requires at least one object file per static archive
++  files_lib_host_iostream += files('iostream_stub.cpp')
++endif
+ 
+ lib_host_iostream = static_library(
+   'host_iostream',
+diff --git a/host/meson.build b/host/meson.build
+index 54b7c49fc..1a098f248 100644
+--- a/host/meson.build
++++ b/host/meson.build
+@@ -10,6 +10,9 @@ inc_stream_servers = include_directories('.')
+ inc_host_include = include_directories('include')
+ 
+ inc_gl_common = include_directories('gl/glestranslator/common/include')
++# Referenced by host/vulkan even when use_gles=false
++inc_gl_openglesdispatch = include_directories('gl/OpenGLESDispatch/include')
++inc_gl_server = include_directories('gl')
+ 
+ subdir('features')
+ subdir('iostream')
+@@ -125,9 +128,19 @@ if use_composer
+ endif
+ 
+ if not use_gles
+-  files_lib_gfxstream_backend += files('native_sub_window_stub.cpp')
++  if host_machine.system() == 'darwin'
++    # Vulkan-only on macOS: use the Metal-backed sub-window implementation.
++    # native_sub_window_cocoa.mm uses NSOpenGL* APIs that are deprecated
++    # in macOS 14 and removed in macOS 26 (Tahoe); native_sub_window_metal.mm
++    # uses only CAMetalLayer and is safe on all supported macOS versions.
++    files_lib_gfxstream_backend += files('native_sub_window_metal.mm')
++  else
++    files_lib_gfxstream_backend += files('native_sub_window_stub.cpp')
++  endif
+ elif host_machine.system() == 'darwin'
+   files_lib_gfxstream_backend += files('native_sub_window_cocoa.mm')
++  # Also include Metal utilities needed by the Vulkan path
++  files_lib_gfxstream_backend += files('native_sub_window_metal.mm')
+ elif host_machine.system() == 'windows'
+   files_lib_gfxstream_backend += files('native_sub_window_win32.cpp')
+ elif host_machine.system() == 'linux' and use_gles
+@@ -164,6 +177,16 @@ if host_machine.system() == 'linux'
+     thread_dep,
+   ]
+   link_args_gfxstream_backend = '-Wl,-lpthread,-lrt,-ldl'
++elif host_machine.system() == 'darwin'
++  deps_gfxstream_backend += [thread_dep]
++  link_args_gfxstream_backend = [
++    '-framework', 'CoreFoundation',
++    '-framework', 'IOKit',
++    '-framework', 'AppKit',
++    '-framework', 'Foundation',
++    '-framework', 'Metal',
++    '-framework', 'QuartzCore',
++  ]
+ endif
+ 
+ if host_machine.system() == 'qnx'
+diff --git a/host/native_sub_window_metal.mm b/host/native_sub_window_metal.mm
+new file mode 100644
+index 000000000..6e5612b17
+--- /dev/null
++++ b/host/native_sub_window_metal.mm
+@@ -0,0 +1,125 @@
++/*
++ * Copyright (C) 2024 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ * http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Metal surface support for VK_EXT_metal_surface / VK_MVK_macos_surface.
++// This file is compiled on Darwin regardless of GFXSTREAM_ENABLE_HOST_GLES
++// so that the Vulkan-only build path has access to CAMetalLayer.
++
++#import <Cocoa/Cocoa.h>
++#import <QuartzCore/CALayer.h>
++#import <QuartzCore/CAMetalLayer.h>
++
++// EmuMetalView: a plain NSView backed by a CAMetalLayer.
++// Used when GFXSTREAM_ENABLE_HOST_GLES=0 (vulkan-only) so that
++// VkSurfaceKHR can be created via VK_EXT_metal_surface.
++@interface EmuMetalView : NSView
++- (CAMetalLayer *)metalLayer;
++@end
++
++@implementation EmuMetalView
++
++- (BOOL)isOpaque { return YES; }
++- (BOOL)wantsUpdateLayer { return YES; }
++
++- (CALayer *)makeBackingLayer {
++    return [CAMetalLayer layer];
++}
++
++- (CAMetalLayer *)metalLayer {
++    return (CAMetalLayer *)self.layer;
++}
++
++@end
++
++// Returns the CAMetalLayer backing the given NSView, or nil.
++// display_surface_vk.cpp calls this when VK_USE_PLATFORM_MACOS_MVK is defined.
++extern "C" void* getMetalLayerFromView(void* view) {
++    if (!view) return nullptr;
++    NSView* nsView = (__bridge NSView*)view;
++
++    // Fast path: view was created by createSubWindow below — it IS an EmuMetalView.
++    if ([nsView isKindOfClass:[EmuMetalView class]]) {
++        return [((EmuMetalView*)nsView) metalLayer];
++    }
++
++    // Fallback: any NSView whose backing layer happens to be a CAMetalLayer.
++    if ([nsView.layer isKindOfClass:[CAMetalLayer class]]) {
++        return nsView.layer;
++    }
++
++    return nullptr;
++}
++
++// createSubWindow / destroySubWindow / moveSubWindow for the vulkan-only path.
++// These are compiled here instead of native_sub_window_cocoa.mm to avoid
++// the NSOpenGL* APIs that were deprecated in macOS 14 and removed in macOS 26.
++#if !GFXSTREAM_ENABLE_HOST_GLES
++
++#include "native_sub_window.h"
++
++EGLNativeWindowType createSubWindow(FBNativeWindowType p_window,
++                                    int x, int y, int width, int height,
++                                    float dpr,
++                                    SubWindowRepaintCallback repaint_callback,
++                                    void* repaint_callback_param,
++                                    int hideWindow) {
++    NSWindow* win = (__bridge NSWindow*)p_window;
++    if (!win) return 0;
++
++    // Cocoa uses a lower-left origin; convert from upper-left.
++    NSRect contentRect = [win contentRectForFrameRect:[win frame]];
++    int cocoaY = (int)contentRect.size.height - (y + height);
++    NSRect frame = NSMakeRect(x, cocoaY, width, height);
++
++    EmuMetalView* view = [[EmuMetalView alloc] initWithFrame:frame];
++    if (!view) return 0;
++
++    view.wantsLayer = YES;
++    [view.layer setContentsScale:dpr];
++    if (hideWindow) view.hidden = YES;
++
++    [[win contentView] addSubview:view];
++    [win makeKeyAndOrderFront:nil];
++
++    return (EGLNativeWindowType)(__bridge_retained void*)view;
++}
++
++void destroySubWindow(EGLNativeWindowType win) {
++    if (!win) return;
++    NSView* view = (__bridge_transfer NSView*)(void*)win;
++    [view removeFromSuperview];
++}
++
++int moveSubWindow(FBNativeWindowType p_window, EGLNativeWindowType p_sub_window,
++                  int x, int y, int width, int height, float dpr) {
++    NSWindow* win = (__bridge NSWindow*)p_window;
++    NSView* view  = (__bridge NSView*)(void*)p_sub_window;
++    if (!win || !view) return 0;
++
++    [view removeFromSuperview];
++    NSRect contentRect = [win contentRectForFrameRect:[win frame]];
++    int cocoaY = (int)contentRect.size.height - (y + height);
++    [view setFrame:NSMakeRect(x, cocoaY, width, height)];
++    [view.layer setContentsScale:dpr];
++    [[win contentView] addSubview:view];
++    return 1;
++}
++
++void* getNativeDisplay() {
++    return nullptr;  // Not needed for Metal/Vulkan path
++}
++
++#endif  // !GFXSTREAM_ENABLE_HOST_GLES
+diff --git a/host/native_sub_window_stub.cpp b/host/native_sub_window_stub.cpp
+index c4379bc19..0156e182c 100644
+--- a/host/native_sub_window_stub.cpp
++++ b/host/native_sub_window_stub.cpp
+@@ -14,6 +14,7 @@
+  * limitations under the License.
+  */
+ 
++#include <stdio.h>
+ #include "gles_compat.h"
+ #include "native_sub_window.h"
+ 
+@@ -35,3 +36,4 @@ void* getNativeDisplay() {
+     fprintf(stderr, "%s: Unimplemented\n", __func__);
+     return nullptr;
+ }
++
+diff --git a/host/snapshot/meson.build b/host/snapshot/meson.build
+index 75188fd9e..db3d0a77f 100644
+--- a/host/snapshot/meson.build
++++ b/host/snapshot/meson.build
+@@ -4,6 +4,10 @@
+ inc_host_snapshot = include_directories('include')
+ 
+ files_lib_host_snapshot = files()
++if host_machine.system() == 'darwin'
++  # macOS ar requires at least one object file per static archive
++  files_lib_host_snapshot += files('snapshot_stub.cpp')
++endif
+ 
+ lib_host_snapshot = static_library(
+   'host_snapshot',
+diff --git a/host/snapshot/snapshot_stub.cpp b/host/snapshot/snapshot_stub.cpp
+new file mode 100644
+index 000000000..7f0353a06
+--- /dev/null
++++ b/host/snapshot/snapshot_stub.cpp
+@@ -0,0 +1 @@
++// macOS stub: ar requires at least one object file per static archive.
+diff --git a/host/vulkan/vk_common_operations.cpp b/host/vulkan/vk_common_operations.cpp
+index a0176202d..a3f3dfbaa 100644
+--- a/host/vulkan/vk_common_operations.cpp
++++ b/host/vulkan/vk_common_operations.cpp
+@@ -2255,7 +2255,7 @@ bool VkEmulation::allocExternalMemory(VulkanDispatch* vk, VkEmulation::ExternalM
+                 // So, do server-side allocation first, then import to Vulkan.
+                 // Note: External memory is only supported for ColorBuffers, in this case.
+                 auto cbInfoPtr = *colorBufferInfo;
+-                std::string bufferName = std::string("VkColorBuffer-") + std::to_string(cbInfoPtr->handle);
++                std::string bufferName = "VkColorBuffer-" + cbInfoPtr->handle;
+                 auto screenStreamBuffer = gfxstream::qnx::createScreenStreamBuffer(
+                     cbInfoPtr->width, cbInfoPtr->height, cbInfoPtr->format, bufferName);
+                 if (!screenStreamBuffer) {
+@@ -3664,7 +3664,7 @@ bool VkEmulation::readColorBufferPixelsScaledCpu(uint32_t colorBufferHandle, int
+                                       readback_r8g8b8a8.data(), readback_r8g8b8a8.size())) {
+         // Could not readback, cannot continue for resizing
+         GFXSTREAM_ERROR("%s: Failed to readback color buffer %d (%" PRIu64 "x%" PRIu64 ", %s)",
+-                        __func__, colorBufferHandle, readbackWidth, readbackHeight,
++                        colorBufferHandle, readbackWidth, readbackHeight,
+                         ToString(colorBufferInfo->format).c_str());
+         return false;
+     }
+@@ -4634,13 +4634,6 @@ bool VkEmulation::readBufferToBytes(uint32_t bufferHandle, uint64_t offset, uint
+         return false;
+     }
+ 
+-    if (offset > bufferInfo->size || size > bufferInfo->size - offset) {
+-        GFXSTREAM_ERROR("Failed to read from Buffer:%d, [offset %" PRIu64 ", size %" PRIu64
+-                        "] out of range of buffer size %" PRIu64 ".",
+-                        bufferHandle, offset, size, bufferInfo->size);
+-        return false;
+-    }
+-
+     const auto& stagingBufferInfo = mStaging;
+     if (size > stagingBufferInfo.mAllocationSize) {
+         GFXSTREAM_ERROR("Failed to read from Buffer:%d, staging buffer too small.", bufferHandle);
+@@ -4727,13 +4720,6 @@ bool VkEmulation::updateBufferFromBytes(uint32_t bufferHandle, uint64_t offset,
+         return false;
+     }
+ 
+-    if (offset > bufferInfo->size || size > bufferInfo->size - offset) {
+-        GFXSTREAM_ERROR("Failed to update Buffer:%d, [offset %" PRIu64 ", size %" PRIu64
+-                        "] out of range of buffer size %" PRIu64 ".",
+-                        bufferHandle, offset, size, bufferInfo->size);
+-        return false;
+-    }
+-
+     const auto& stagingBufferInfo = mStaging;
+     if (size > stagingBufferInfo.mAllocationSize) {
+         GFXSTREAM_ERROR("Failed to update Buffer:%d, staging buffer too small.", bufferHandle);
+diff --git a/meson.build b/meson.build
+index 80f1c0b5a..033bad490 100644
+--- a/meson.build
++++ b/meson.build
+@@ -1,7 +1,7 @@
+ # Copyright 2023 Android Open Source Project
+ # SPDX-License-Identifier: Apache-2.0
+ 
+-project('gfxstream', 'cpp', 'c',
++project('gfxstream', 'cpp', 'c', 'objc', 'objcpp',
+          version : '0.1.2',
+          license : 'Apache-2.0',
+          default_options : ['cpp_std=gnu++17',
+@@ -78,6 +78,12 @@ elif host_machine.system() == 'linux'
+   gfxstream_host_args += '-DGFXSTREAM_UNSTABLE_VULKAN_EXTERNAL_SYNC=1'
+   gfxstream_host_args += '-DGFXSTREAM_UNSTABLE_VULKAN_BLOB_COLOR_BUFFER=1'
+   gfxstream_host_args += '-DHAVE_MEMFD_CREATE=1'
++elif host_machine.system() == 'darwin'
++  thread_dep = dependency('threads')
++  # macOS: Vulkan via MoltenVK (loaded at runtime as libvulkan.dylib)
++  gfxstream_host_args += '-DGFXSTREAM_PLATFORM_MACOS=1'
++  gfxstream_host_args += '-DVK_USE_PLATFORM_METAL_EXT=1'
++  gfxstream_host_args += '-DVK_USE_PLATFORM_MACOS_MVK=1'
+ else
+   thread_dep = dependency('threads')
+ endif
+-- 
+2.53.0
+

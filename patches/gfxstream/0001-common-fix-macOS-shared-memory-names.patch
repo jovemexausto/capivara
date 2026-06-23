@@ -1,0 +1,40 @@
+From 97017bddb220f7c6d62b26a042a5aa9f9d0fdce2 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Mon, 22 Jun 2026 23:15:31 -0300
+Subject: [PATCH 1/5] common: fix macOS shared memory names
+
+Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>
+---
+ common/base/SharedMemory_posix.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/common/base/SharedMemory_posix.cpp b/common/base/SharedMemory_posix.cpp
+index 638751a07..05c901398 100644
+--- a/common/base/SharedMemory_posix.cpp
++++ b/common/base/SharedMemory_posix.cpp
+@@ -55,7 +55,11 @@ SharedMemory::SharedMemory(const std::string& name, size_t size) {
+         mName = PathUtils::recompose(PathUtils::decompose(std::move(path)));
+     } else {
+         mShareType = ShareType::SHARED_MEMORY;
++#ifdef __APPLE__
++        mName = (!name.empty() && name[0] != '/') ? ("/" + name) : name;
++#else
+         mName = name;
++#endif
+     }
+ }
+ 
+@@ -111,7 +115,9 @@ int SharedMemory::openInternal(int oflag, int mode, bool doMapping) {
+     int err = 0;
+     struct stat sb;
+     if (mShareType == ShareType::SHARED_MEMORY) {
+-#if defined(HAVE_MEMFD_CREATE)
++#if defined(__APPLE__)
++        mFd = ::shm_open(mName.c_str(), oflag, mode);
++#elif defined(HAVE_MEMFD_CREATE)
+         mFd = memfd_create(mName.c_str(), MFD_CLOEXEC | MFD_ALLOW_SEALING);
+ #else
+         mFd = syscall(__NR_memfd_create, mName.c_str(), FD_CLOEXEC);
+-- 
+2.53.0
+

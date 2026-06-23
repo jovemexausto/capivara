@@ -1,0 +1,151 @@
+From b2315087f3f81898852be4a5a2e9b2fe30cf0c5a Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 17:09:49 -0300
+Subject: [PATCH 4/5] host: fix macOS build for decoders=vulkan,gles,composer
+
+Seven real bugs in the foundational macOS build (previous commit)
+blocked compiling with the GLES/composer decoders also enabled, not
+just Vulkan-only:
+
+- frame_buffer.cpp: missing closing brace in
+  getEmulatedEglWindowSurfaceColorBufferHandle
+- frame_buffer.cpp: 3 duplicate function definitions
+- frame_buffer.cpp: FrameBuffer::getConfigs wrapper was missing
+- meson.build: .mm (Objective-C++) sources don't inherit cpp_args, so
+  GFXSTREAM_ENABLE_HOST_GLES was never defined for them; added
+  objcpp_args to the darwin library() call
+- meson.build: OpenGL/IOSurface/CoreVideo frameworks needed
+  conditionally for the GLES decoder
+- native_sub_window_metal.mm: getMetalLayerFromView duplicate
+  definition needed a #if !GFXSTREAM_ENABLE_HOST_GLES guard
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>
+---
+ host/frame_buffer.cpp           | 29 +++++++----------------------
+ host/meson.build                | 17 +++++++++++++++++
+ host/native_sub_window_metal.mm |  7 +++++++
+ 3 files changed, 31 insertions(+), 22 deletions(-)
+
+diff --git a/host/frame_buffer.cpp b/host/frame_buffer.cpp
+index 587cac22e..669138722 100644
+--- a/host/frame_buffer.cpp
++++ b/host/frame_buffer.cpp
+@@ -4054,15 +4054,12 @@ HandleType FrameBuffer::Impl::getEmulatedEglWindowSurfaceColorBufferHandle(Handl
+ 
+     auto it = m_EmulatedEglWindowSurfaceToColorBuffer.find(p_surface);
+     if (it == m_EmulatedEglWindowSurfaceToColorBuffer.end()) {
++        GFXSTREAM_ERROR("Failed to find EmulatedEglWindowSurface:%d", p_surface);
++        return 0;
++    }
+     return it->second;
+ }
+ 
+-void FrameBuffer::Impl::setScreenMask(int width, int height, const uint8_t* rgbaData) {
+-    m_compositor->setScreenMask(width, height, rgbaData);
+-}
+-
+-
+-
+ #ifdef CONFIG_AEMU
+ void FrameBuffer::Impl::registerVulkanInstance(uint64_t id, const char* appName) const {
+     auto* tInfo = RenderThreadInfo::get();
+@@ -4086,17 +4083,6 @@ void FrameBuffer::Impl::unregisterVulkanInstance(uint64_t id) const {
+ }
+ #endif
+ 
+-void FrameBuffer::Impl::createTrivialContext(HandleType shared, HandleType* contextOut,
+-                                             HandleType* surfOut) {
+-    assert(contextOut);
+-    assert(surfOut);
+-
+-    *contextOut = createEmulatedEglContext(0, shared, GLESApi_2);
+-    // Zero size is formally allowed here, but SwiftShader doesn't like it and
+-    // fails.
+-    *surfOut = createEmulatedEglWindowSurface(0, 1, 1);
+-}
+-
+ void FrameBuffer::Impl::createSharedTrivialContext(EGLContext* contextOut, EGLSurface* surfOut) {
+     assert(contextOut);
+     assert(surfOut);
+@@ -5531,13 +5517,12 @@ void FrameBuffer::getNumConfigs(int* outNumConfigs, int* outNumAttribs) {
+     mImpl->getNumConfigs(outNumConfigs, outNumAttribs);
+ }
+ 
+-EGLint FrameBuffer::chooseConfig(EGLint* attribs, EGLint* configs, EGLint configsSize) {
+-    return mImpl->chooseConfig(attribs, configs, configsSize);
++EGLint FrameBuffer::getConfigs(uint32_t bufferSize, GLuint* buffer) {
++    return mImpl->getConfigs(bufferSize, buffer);
+ }
+ 
+-void FrameBuffer::getDeviceInfo(const char** vendor, const char** renderer,
+-                               const char** version) const {
+-    mImpl->getDeviceInfo(vendor, renderer, version);
++EGLint FrameBuffer::chooseConfig(EGLint* attribs, EGLint* configs, EGLint configsSize) {
++    return mImpl->chooseConfig(attribs, configs, configsSize);
+ }
+ 
+ HandleType FrameBuffer::createEmulatedEglContext(int p_config, HandleType p_share,
+diff --git a/host/meson.build b/host/meson.build
+index 1a098f248..085425432 100644
+--- a/host/meson.build
++++ b/host/meson.build
+@@ -187,6 +187,16 @@ elif host_machine.system() == 'darwin'
+     '-framework', 'Metal',
+     '-framework', 'QuartzCore',
+   ]
++  if use_gles
++    # host/gl/glestranslator/egl/mac_native.m drives the legacy native
++    # NSOpenGL/CGL path (glBindTexture/CGLTexImageIOSurface2D/etc.) that the
++    # GLES decoder needs on Darwin.
++    link_args_gfxstream_backend += [
++      '-framework', 'OpenGL',
++      '-framework', 'IOSurface',
++      '-framework', 'CoreVideo',
++    ]
++  endif
+ endif
+ 
+ if host_machine.system() == 'qnx'
+@@ -201,6 +211,13 @@ gfxstream_backend = library(
+   'gfxstream_backend',
+   files_lib_gfxstream_backend,
+   cpp_args: gfxstream_host_args + gfxstream_backend_cpp_args,
++  # .mm (Objective-C++) sources are compiled via a separate arg list from
++  # .cpp; without this, GFXSTREAM_ENABLE_HOST_GLES is never defined for them,
++  # so e.g. native_sub_window_metal.mm's `#if !GFXSTREAM_ENABLE_HOST_GLES`
++  # guard always sees the macro as undefined (== 0) and compiles its
++  # GLES-build-only fallback unconditionally, clashing with
++  # native_sub_window_cocoa.mm when the GLES decoder is also enabled.
++  objcpp_args: gfxstream_host_args + gfxstream_backend_cpp_args,
+   include_directories: [inc_gfxstream_backend],
+   gnu_symbol_visibility: 'default',
+   dependencies: deps_gfxstream_backend,
+diff --git a/host/native_sub_window_metal.mm b/host/native_sub_window_metal.mm
+index 6e5612b17..a84a851cd 100644
+--- a/host/native_sub_window_metal.mm
++++ b/host/native_sub_window_metal.mm
+@@ -46,6 +46,12 @@
+ 
+ // Returns the CAMetalLayer backing the given NSView, or nil.
+ // display_surface_vk.cpp calls this when VK_USE_PLATFORM_MACOS_MVK is defined.
++//
++// When the GLES decoder is also built, native_sub_window_cocoa.mm provides its
++// own getMetalLayerFromView() for the view type *it* creates
++// (EmuGLViewWithMetal); this version is for the EmuMetalView type created by
++// createSubWindow() below, which only exists in the Vulkan-only build.
++#if !GFXSTREAM_ENABLE_HOST_GLES
+ extern "C" void* getMetalLayerFromView(void* view) {
+     if (!view) return nullptr;
+     NSView* nsView = (__bridge NSView*)view;
+@@ -62,6 +68,7 @@ extern "C" void* getMetalLayerFromView(void* view) {
+ 
+     return nullptr;
+ }
++#endif  // !GFXSTREAM_ENABLE_HOST_GLES
+ 
+ // createSubWindow / destroySubWindow / moveSubWindow for the vulkan-only path.
+ // These are compiled here instead of native_sub_window_cocoa.mm to avoid
+-- 
+2.53.0
+
