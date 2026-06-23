@@ -1,0 +1,97 @@
+From ac8b9f91d44f49f0bc98313f2f21928274bdf13b Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 16:30:43 -0300
+Subject: [PATCH 4/6] rutabaga_gfx/gfxstream: compute map_ptr for HOST3D blobs
+ on macOS
+
+create_blob's RutabagaResource hardcoded map_ptr: None on macOS for every
+gfxstream blob. resource_map_blob (virtio_gpu.rs) requires it to be set
+before it will even attempt the hv_vm_map handoff (WorkerMessage::GpuAddMapping)
+that exposes the blob to the guest -- with None, every HOST3D blob mapping
+failed immediately with SpecViolation("no map ptr available"), surfacing
+in the guest as "mmap64 failed with (Invalid argument)" with no indication
+the host never even attempted the mapping.
+
+The Venus/virglrenderer path gets an equivalent host VA via
+virgl_renderer_resource_get_map_ptr(); gfxstream has no such native API.
+export_blob() does give a real fd (RUTABAGA_MEM_HANDLE_TYPE_SHM, a POSIX shm
+object on this gfxstream build), so mmap that fd directly to get the host VA.
+
+One correctness note inline in the diff: export_blob() calls into
+gfxstream's releaseHandle(), which is std::exchange(mFd, invalid) on the
+host side -- a one-shot move, not idempotent. Calling export_blob() twice
+(once for the handle field, once more to derive map_ptr) would hand back
+an invalid fd on the second call. Compute the handle once and reuse it for
+both fields.
+
+This is the fix that first made the gfxstream/ASG ring buffer functional
+on libkrun/HVF macOS -- without it, hardware-accelerated Vulkan never
+worked on this platform at all. Builds on the gfxstream Vulkan-only
+integration scaffolding (two commits back).
+---
+ src/rutabaga_gfx/src/gfxstream.rs | 35 +++++++++++++++++++++++++++++--
+ 1 file changed, 33 insertions(+), 2 deletions(-)
+
+diff --git a/src/rutabaga_gfx/src/gfxstream.rs b/src/rutabaga_gfx/src/gfxstream.rs
+index 6b7a820..40b92c4 100644
+--- a/src/rutabaga_gfx/src/gfxstream.rs
++++ b/src/rutabaga_gfx/src/gfxstream.rs
+@@ -28,6 +28,7 @@ use crate::renderer_utils::*;
+ use crate::rutabaga_core::RutabagaComponent;
+ use crate::rutabaga_core::RutabagaContext;
+ use crate::rutabaga_core::RutabagaResource;
++use crate::rutabaga_os::AsRawDescriptor;
+ use crate::rutabaga_os::FromRawDescriptor;
+ use crate::rutabaga_os::IntoRawDescriptor;
+ use crate::rutabaga_os::RawDescriptor;
+@@ -632,15 +633,45 @@ impl RutabagaComponent for Gfxstream {
+ 
+         ret_to_res(ret)?;
+ 
++        // NOTE: `export_blob()` calls into gfxstream's `releaseHandle()`, which is a
++        // one-shot `std::exchange(mFd, invalid)` on the host side -- calling it twice
++        // would hand back an invalid fd on the second call. Compute the handle once and
++        // derive `map_ptr` from it (instead of calling `export_blob` again) so the same
++        // fd backs both fields below.
++        let handle = self.export_blob(resource_id).ok();
++
++        #[cfg(target_os = "macos")]
++        let map_ptr = handle.as_ref().and_then(|h| {
++            if h.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM {
++                let addr = unsafe {
++                    libc::mmap(
++                        null_mut(),
++                        resource_create_blob.size as usize,
++                        libc::PROT_READ | libc::PROT_WRITE,
++                        libc::MAP_SHARED,
++                        h.os_handle.as_raw_descriptor(),
++                        0,
++                    )
++                };
++                if addr == libc::MAP_FAILED {
++                    None
++                } else {
++                    Some(addr as u64)
++                }
++            } else {
++                None
++            }
++        });
++
+         Ok(RutabagaResource {
+             resource_id,
+-            handle: self.export_blob(resource_id).ok(),
++            handle,
+             blob: true,
+             blob_mem: resource_create_blob.blob_mem,
+             blob_flags: resource_create_blob.blob_flags,
+             map_info: self.map_info(resource_id).ok(),
+             #[cfg(target_os = "macos")]
+-            map_ptr: None,
++            map_ptr,
+             info_2d: None,
+             info_3d: None,
+             vulkan_info: self.vulkan_info(resource_id).ok(),
+-- 
+2.53.0
+

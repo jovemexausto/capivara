@@ -1,0 +1,30 @@
+From cce18869fd7c2fb2249b383a9ebc3cc57018431b Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 16:22:29 -0300
+Subject: [PATCH 3/6] devices: declare gpu-gfxstream feature
+
+The macOS+gfxstream cfg gate (#[cfg(all(target_os = "macos", feature =
+"gpu-gfxstream"))], used throughout virtio_gpu.rs/worker.rs) needs this
+feature to actually exist in Cargo.toml. Enables the base gpu feature plus
+rutabaga_gfx's own gfxstream feature, which the macOS dependency override
+for rutabaga_gfx (currently only re-declared with ["x"] on linux, ["virgl_renderer",
+"virgl_renderer_next"] as the macOS-applicable base default) doesn't turn on.
+---
+ src/devices/Cargo.toml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index fe8e4f3..0c525b0 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -15,6 +15,7 @@ tdx = ["blk", "tee"]
+ net = []
+ blk = []
+ gpu = ["rutabaga_gfx", "thiserror", "zerocopy", "krun_display"]
++gpu-gfxstream = ["gpu", "rutabaga_gfx/gfxstream"]
+ input = ["zerocopy", "krun_input"]
+ virgl_resource_map2 = []
+ aws-nitro = []
+-- 
+2.53.0
+

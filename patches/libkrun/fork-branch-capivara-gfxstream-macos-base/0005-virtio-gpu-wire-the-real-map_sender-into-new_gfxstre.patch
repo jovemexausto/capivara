@@ -1,0 +1,107 @@
+From c716dcb517079360c303ccecac2cd1dd5e071538 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 16:31:57 -0300
+Subject: [PATCH 5/6] virtio/gpu: wire the real map_sender into new_gfxstream
+ on macOS
+
+new_gfxstream constructed a throwaway channel for map_sender (receiver
+dropped immediately) instead of taking the live one serviced by the vmm
+worker thread. This was harmless while resource_map_blob never reached
+the WorkerMessage::GpuAddMapping send (it returned early on the missing
+map_ptr -- see the map_ptr fix one commit back). Once map_ptr is
+populated, resource_map_blob does reach the send, and .unwrap() on a
+channel with no receiver panics the GPU worker thread, hanging the
+guest's DRM_IOCTL_VIRTGPU_WAIT indefinitely during ASG ring setup.
+
+Plumb the real map_sender (already present on Worker, used by the
+non-gfxstream path) through into new_gfxstream instead.
+---
+ src/devices/src/virtio/gpu/virtio_gpu.rs | 39 +++++++++++++++---------
+ src/devices/src/virtio/gpu/worker.rs     |  1 +
+ 2 files changed, 25 insertions(+), 15 deletions(-)
+
+diff --git a/src/devices/src/virtio/gpu/virtio_gpu.rs b/src/devices/src/virtio/gpu/virtio_gpu.rs
+index ab0e118..284cb3a 100644
+--- a/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -400,14 +400,18 @@ impl VirtioGpu {
+ 
+     /// Variant of [`new`] for the macOS + gfxstream (Vulkan-only) path.
+     ///
+-    /// Does not need `virgl_flags` or a `map_sender`; creates the Rutabaga
+-    /// instance via `create_rutabaga_gfxstream` and falls back to a headless
+-    /// 2-D renderer if that fails.
++    /// Does not need `virgl_flags`; creates the Rutabaga instance via
++    /// `create_rutabaga_gfxstream` and falls back to a headless 2-D renderer if
++    /// that fails. The `map_sender` is required: gfxstream's ASG ring buffer is a
++    /// HOST3D blob that `resource_map_blob` maps into the guest via
++    /// `WorkerMessage::GpuAddMapping` (hv_vm_map), so the channel must be the live
++    /// one serviced by the vmm worker, not a disconnected stub.
+     #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+     pub fn new_gfxstream(
+         mem: GuestMemoryMmap,
+         queue_ctl: Arc<Mutex<VirtQueue>>,
+         interrupt: InterruptTransport,
++        map_sender: Sender<WorkerMessage>,
+         export_table: Option<ExportTable>,
+         displays: Box<[DisplayInfo]>,
+         display_backend: DisplayBackend,
+@@ -453,13 +457,7 @@ impl VirtioGpu {
+             displays,
+             display_backend,
+             #[cfg(target_os = "macos")]
+-            map_sender: {
+-                // new_gfxstream does not need a map_sender (no Metal external
+-                // memory import via virglrenderer); use an unbounded channel
+-                // that satisfies the struct field but is never consumed.
+-                let (tx, _rx) = unbounded();
+-                tx
+-            },
++            map_sender,
+         }
+     }
+ 
+@@ -697,12 +695,23 @@ impl VirtioGpu {
+     /// Can also be used to invalidate caches.
+     pub fn transfer_read(
+         &mut self,
+-        _ctx_id: u32,
+-        _resource_id: u32,
+-        _transfer: Transfer3D,
+-        _buf: Option<VolatileSlice>,
++        ctx_id: u32,
++        resource_id: u32,
++        transfer: Transfer3D,
++        buf: Option<VolatileSlice>,
+     ) -> VirtioGpuResult {
+-        panic!("virtio_gpu: transfer_read unimplemented");
++        // gfxstream's ASG ring relies on TRANSFER_FROM_HOST_3D to read host-produced
++        // data back (e.g. the ring's read pointer / response area). The control-queue
++        // call path passes `buf: None`, transferring into the resource's own backing;
++        // support an explicit destination slice too for completeness.
++        let buf = buf.map(|s| {
++            // SAFETY: the volatile slice points at a live, correctly-sized guest
++            // mapping for the duration of this call.
++            unsafe { IoSliceMut::new(std::slice::from_raw_parts_mut(s.ptr_guard_mut().as_ptr(), s.len())) }
++        });
++        self.rutabaga
++            .transfer_read(ctx_id, resource_id, transfer, buf)?;
++        Ok(OkNoData)
+     }
+ 
+     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
+diff --git a/src/devices/src/virtio/gpu/worker.rs b/src/devices/src/virtio/gpu/worker.rs
+index b5e2cdf..df0bc0e 100644
+--- a/src/devices/src/virtio/gpu/worker.rs
++++ b/src/devices/src/virtio/gpu/worker.rs
+@@ -95,6 +95,7 @@ impl Worker {
+             self.mem.clone(),
+             self.control_queue.clone(),
+             self.interrupt.clone(),
++            self.map_sender.clone(),
+             self.export_table.take(),
+             self.displays.clone(),
+             self.display_backend,
+-- 
+2.53.0
+

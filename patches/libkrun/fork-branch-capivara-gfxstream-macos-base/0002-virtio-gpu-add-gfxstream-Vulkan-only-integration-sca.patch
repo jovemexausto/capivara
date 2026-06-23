@@ -1,0 +1,241 @@
+From a6747430017f6cfaea79654ec0564ad1383ebf25 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 16:19:21 -0300
+Subject: [PATCH 2/6] virtio/gpu: add gfxstream Vulkan-only integration
+ scaffolding for macOS
+
+Adds the macOS+gfxstream path that bypasses virglrenderer entirely:
+create_rutabaga_gfxstream() configures a Vulkan-only RutabagaBuilder
+(GFXSTREAM_ENABLE_HOST_GLES=0 build target -- EGL/GLES/GLX disabled,
+external blob + Vulkan only), and new_gfxstream() wires it into VirtioGpu
+with a fallback to the headless 2-D renderer if gfxstream init fails.
+
+Also extends resource_map_blob (macOS) to accept
+RUTABAGA_MEM_HANDLE_TYPE_SHM in addition to RUTABAGA_MEM_HANDLE_TYPE_APPLE
+when mapping blob resources, alongside the map_sender field/Worker wiring
+this path needs (hv_vm_map via WorkerMessage::GpuAddMapping).
+
+This scaffolding is what subsequent gfxstream-macOS patches build on
+(map_ptr computation for HOST3D blobs, the TransferFromHost3d dispatcher
+fix, and the GLES decoder build work) -- without it those patches don't
+apply meaningfully, since the functions/fields they touch don't exist yet.
+
+Validated as part of the macOS/HVF Android boot path that reaches
+sys.boot_completed=1 locally (gfxstream/ranchu Vulkan via MoltenVK/Metal).
+---
+ src/devices/src/virtio/gpu/virtio_gpu.rs | 131 ++++++++++++++++++++++-
+ src/devices/src/virtio/gpu/worker.rs     |  13 +++
+ 2 files changed, 140 insertions(+), 4 deletions(-)
+
+diff --git a/src/devices/src/virtio/gpu/virtio_gpu.rs b/src/devices/src/virtio/gpu/virtio_gpu.rs
+index 67edb5f..ab0e118 100644
+--- a/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -18,8 +18,6 @@ use krun_display::{
+     DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
+ };
+ use libc::c_void;
+-#[cfg(target_os = "macos")]
+-use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_APPLE;
+ #[cfg(all(feature = "virgl_resource_map2", target_os = "linux"))]
+ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_DMABUF;
+ #[cfg(all(not(feature = "virgl_resource_map2"), target_os = "linux"))]
+@@ -37,8 +35,10 @@ use rutabaga_gfx::{
+     Transfer3D,
+ };
+ #[cfg(target_os = "macos")]
++use rutabaga_gfx::{RUTABAGA_MEM_HANDLE_TYPE_APPLE, RUTABAGA_MEM_HANDLE_TYPE_SHM};
++#[cfg(target_os = "macos")]
+ use utils::worker_message::WorkerMessage;
+-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
++use vm_memory::{GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
+ 
+ use super::{GpuError, Result};
+ use crate::virtio::display::DisplayInfo;
+@@ -299,6 +299,53 @@ impl VirtioGpu {
+         builder.clone().build(fence.clone(), None).ok()
+     }
+ 
++    /// Create a Rutabaga instance backed by gfxstream (Vulkan-only path).
++    ///
++    /// Unlike `create_rutabaga()` this does not require a Wayland/X11 display
++    /// socket. It initialises gfxstream with `use_vulkan=true` and all GL/EGL
++    /// flags disabled, which matches the `GFXSTREAM_ENABLE_HOST_GLES=0` build
++    /// of libgfxstream_backend.dylib produced in SP-1.
++    ///
++    /// `display_width` / `display_height` are the initial framebuffer dimensions
++    /// reported to the guest; they can be zero for headless/offscreen builds.
++    #[cfg(feature = "gpu-gfxstream")]
++    pub fn create_rutabaga_gfxstream(
++        mem: GuestMemoryMmap,
++        queue_ctl: Arc<Mutex<VirtQueue>>,
++        interrupt: InterruptTransport,
++        fence_state: Arc<Mutex<FenceState>>,
++        display_width: u32,
++        display_height: u32,
++    ) -> Option<Rutabaga> {
++        // Vulkan-only: configure via RutabagaBuilder fluent API.
++        // GFXSTREAM_ENABLE_HOST_GLES=0 means EGL/GLES are unavailable;
++        // use_vulkan(true) is the only meaningful flag here.
++        let builder = RutabagaBuilder::new(
++            rutabaga_gfx::RutabagaComponentType::Gfxstream,
++            0, // virgl_flags — unused by gfxstream component
++            0, // capset_mask — let gfxstream report its own capsets
++        )
++        .set_display_width(display_width)
++        .set_display_height(display_height)
++        .set_use_egl(false)
++        .set_use_gles(false)
++        .set_use_glx(false)
++        .set_use_surfaceless(false)
++        .set_use_vulkan(true)
++        .set_use_external_blob(true)
++        .set_use_system_blob(false);
++
++        let fence =
++            Self::create_fence_handler(mem, queue_ctl.clone(), fence_state.clone(), interrupt);
++        match builder.build(fence, None) {
++            Ok(rutabaga) => Some(rutabaga),
++            Err(e) => {
++                error!("gfxstream rutabaga init failed: {e:?}");
++                None
++            }
++        }
++    }
++
+     #[allow(clippy::too_many_arguments)]
+     pub fn new(
+         mem: GuestMemoryMmap,
+@@ -351,6 +398,71 @@ impl VirtioGpu {
+         }
+     }
+ 
++    /// Variant of [`new`] for the macOS + gfxstream (Vulkan-only) path.
++    ///
++    /// Does not need `virgl_flags` or a `map_sender`; creates the Rutabaga
++    /// instance via `create_rutabaga_gfxstream` and falls back to a headless
++    /// 2-D renderer if that fails.
++    #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
++    pub fn new_gfxstream(
++        mem: GuestMemoryMmap,
++        queue_ctl: Arc<Mutex<VirtQueue>>,
++        interrupt: InterruptTransport,
++        export_table: Option<ExportTable>,
++        displays: Box<[DisplayInfo]>,
++        display_backend: DisplayBackend,
++    ) -> Self {
++        let fence_state = Arc::new(Mutex::new(Default::default()));
++
++        // Use display dimensions from the first scanout, or sensible defaults.
++        let (display_width, display_height) = displays
++            .first()
++            .map(|d| (d.width, d.height))
++            .unwrap_or((1280, 1024));
++
++        let rutabaga = match Self::create_rutabaga_gfxstream(
++            mem.clone(),
++            queue_ctl.clone(),
++            interrupt.clone(),
++            fence_state.clone(),
++            display_width,
++            display_height,
++        ) {
++            Some(r) => r,
++            None => {
++                warn!("Failed to initialise gfxstream backend; falling back to 2-D renderer");
++                Self::create_fallback_rutabaga(
++                    mem.clone(),
++                    queue_ctl.clone(),
++                    interrupt.clone(),
++                    fence_state.clone(),
++                )
++                .expect("Fallback rutabaga initialization failed")
++            }
++        };
++
++        let display_backend = display_backend
++            .create_instance()
++            .expect("Failed to create display backend instance!");
++
++        Self {
++            rutabaga,
++            resources: Default::default(),
++            fence_state,
++            scanouts: Default::default(),
++            displays,
++            display_backend,
++            #[cfg(target_os = "macos")]
++            map_sender: {
++                // new_gfxstream does not need a map_sender (no Metal external
++                // memory import via virglrenderer); use an unbounded channel
++                // that satisfies the struct field but is never consumed.
++                let (tx, _rx) = unbounded();
++                tx
++            },
++        }
++    }
++
+     // Non-public function -- no doc comment needed!
+     fn result_from_query(&mut self, resource_id: u32) -> GpuResponse {
+         match self.rutabaga.query(resource_id) {
+@@ -905,7 +1017,14 @@ impl VirtioGpu {
+         let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
+ 
+         if let Ok(export) = self.rutabaga.export_blob(resource_id) {
+-            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE {
++            debug!(
++                "resource_map_blob: export handle_type={} map_ptr={:x}",
++                export.handle_type, map_ptr
++            );
++
++            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
++                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
++            {
+                 if offset + resource.size > shm_region.size as u64 {
+                     error!("mapping DOES NOT FIT");
+                     return Err(ErrUnspec);
+@@ -930,6 +1049,10 @@ impl VirtioGpu {
+                     return Err(ErrUnspec);
+                 }
+             } else {
++                error!(
++                    "resource_map_blob: unsupported export handle_type={} for resource {}",
++                    export.handle_type, resource_id
++                );
+                 return Err(ErrUnspec);
+             }
+         } else {
+diff --git a/src/devices/src/virtio/gpu/worker.rs b/src/devices/src/virtio/gpu/worker.rs
+index 843d45a..b5e2cdf 100644
+--- a/src/devices/src/virtio/gpu/worker.rs
++++ b/src/devices/src/virtio/gpu/worker.rs
+@@ -88,6 +88,18 @@ impl Worker {
+     }
+ 
+     fn work(mut self) {
++        // On macOS with the gfxstream feature, bypass virglrenderer entirely
++        // and initialise rutabaga directly with the Gfxstream component.
++        #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
++        let mut virtio_gpu = VirtioGpu::new_gfxstream(
++            self.mem.clone(),
++            self.control_queue.clone(),
++            self.interrupt.clone(),
++            self.export_table.take(),
++            self.displays.clone(),
++            self.display_backend,
++        );
++        #[cfg(not(all(target_os = "macos", feature = "gpu-gfxstream")))]
+         let mut virtio_gpu = VirtioGpu::new(
+             self.mem.clone(),
+             self.control_queue.clone(),
+@@ -346,6 +358,7 @@ impl Worker {
+         }
+     }
+ 
++
+     fn process_queue(
+         &mut self,
+         virtio_gpu: &mut VirtioGpu,
+-- 
+2.53.0
+

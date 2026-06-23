@@ -1,0 +1,83 @@
+From 40bc483944644314b045f3f271ca13fc62272f6f Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 16:18:29 -0300
+Subject: [PATCH 1/6] rutabaga_gfx/gfxstream: fix macOS+gfxstream build
+ (pre-existing, unrelated to our work)
+
+`cargo check -p krun-rutabaga-gfx --features gfxstream` does not currently
+build on this crate's own edition-2024 setting, independent of any of our
+changes -- confirmed by checking out main with no patches applied:
+
+- The stream_renderer_* extern block uses `extern "C" { ... }`, which
+  edition 2024 requires to be `unsafe extern "C" { ... }`.
+- RutabagaResource's macOS-only map_ptr field (Option<u64>) is missing
+  from two of its three constructors in this file (create_3d's and
+  create_blob's struct literals); only a third site elsewhere already has
+  it. Add map_ptr: None to both -- harmless defaults, matching what the
+  third site already does. (A later commit changes create_blob's None to
+  a real computed value; this commit only restores compilability.)
+- Two direct function-pointer-to-integer casts trigger the
+  function_casts_as_integer lint as hard warnings; route through
+  `as *const ()` first like the rest of the file already does elsewhere,
+  per the compiler's own suggested fix.
+
+No CI job in .github/workflows appears to exercise gfxstream+macOS, which
+is presumably why this was never caught. This commit only restores
+buildability; it does not change behavior on any platform where this
+combination of feature+cfg gates was already compiling.
+---
+ src/rutabaga_gfx/src/gfxstream.rs | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/src/rutabaga_gfx/src/gfxstream.rs b/src/rutabaga_gfx/src/gfxstream.rs
+index 2b13c27..6b7a820 100644
+--- a/src/rutabaga_gfx/src/gfxstream.rs
++++ b/src/rutabaga_gfx/src/gfxstream.rs
+@@ -91,7 +91,7 @@ pub type stream_renderer_fence = RutabagaFence;
+ #[allow(non_camel_case_types)]
+ pub type stream_renderer_debug = RutabagaDebug;
+ 
+-extern "C" {
++unsafe extern "C" {
+     // Entry point for the stream renderer.
+     fn stream_renderer_init(
+         stream_renderer_params: *mut stream_renderer_param,
+@@ -313,7 +313,7 @@ impl Gfxstream {
+             },
+             stream_renderer_param {
+                 key: STREAM_RENDERER_PARAM_FENCE_CALLBACK,
+-                value: write_context_fence as usize as u64,
++                value: write_context_fence as *const () as usize as u64,
+             },
+             stream_renderer_param {
+                 key: STREAM_RENDERER_PARAM_WIN0_WIDTH,
+@@ -326,7 +326,7 @@ impl Gfxstream {
+             if use_debug {
+                 stream_renderer_param {
+                     key: STREAM_RENDERER_PARAM_DEBUG_CALLBACK,
+-                    value: gfxstream_debug_callback as usize as u64,
++                    value: gfxstream_debug_callback as *const () as usize as u64,
+                 }
+             } else {
+                 stream_renderer_param {
+@@ -457,6 +457,8 @@ impl RutabagaComponent for Gfxstream {
+             blob_mem: 0,
+             blob_flags: 0,
+             map_info: None,
++            #[cfg(target_os = "macos")]
++            map_ptr: None,
+             info_2d: None,
+             info_3d: None,
+             vulkan_info: None,
+@@ -637,6 +639,8 @@ impl RutabagaComponent for Gfxstream {
+             blob_mem: resource_create_blob.blob_mem,
+             blob_flags: resource_create_blob.blob_flags,
+             map_info: self.map_info(resource_id).ok(),
++            #[cfg(target_os = "macos")]
++            map_ptr: None,
+             info_2d: None,
+             info_3d: None,
+             vulkan_info: self.vulkan_info(resource_id).ok(),
+-- 
+2.53.0
+
