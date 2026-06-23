@@ -83,6 +83,39 @@ scaffolding, (3) the `gpu-gfxstream` feature declaration, (4) the `map_ptr` hist
 `map_sender` wiring fix, (6) the `TransferFromHost3d` deferred-dispatch fix. Each one was individually
 `cargo check`-validated (for `krun-rutabaga-gfx`) before moving to the next.
 
+## Update: vm-memory 0.17→0.18 migration done (separate branch)
+
+Resolved the blocker from the section above. New local-only branch `capivara/vm-memory-0.18` in the
+`/tmp/capivara-upstreams/libkrun` clone, built from fork's clean `main` (not the gfxstream branch — kept
+separate on purpose, since this is a real, independently-useful migration). Single commit `5fc25ac`:
+
+- Bumped `vm-memory` to `0.18.0` across all 6 workspace `Cargo.toml`s that reference it (`libkrun`,
+  `smbios`, `vmm`, `arch`, `kernel`, `devices`).
+- In 0.18, `GuestMemory`'s default methods (`get_slice`, `try_access`, `find_region`, `checked_offset`,
+  `get_host_address`, `last_addr`, `address_in_range`, ...) moved to a new `GuestMemoryBackend` trait with
+  a blanket impl. Any file importing only `GuestMemory` loses access to them. Fixed by adding
+  `GuestMemoryBackend` to the `vm_memory` import in 7 files: `balloon/device.rs`, `console/process_tx.rs`,
+  `console/process_rx.rs`, `descriptor_utils.rs`, `queue.rs`, `gpu/virtio_gpu.rs`, `kernel/loader/mod.rs` —
+  plus one generic bound update in `vsock/packet.rs::get_host_address` (`<T: GuestMemory>` →
+  `<T: GuestMemory + GuestMemoryBackend>`).
+- Separately, `console/port_io/unix.rs`'s `OwnedFd::write_volatile` was missing because vm-memory's
+  `rawfd` feature (which provides the `WriteVolatile`/`ReadVolatile` impls for raw-fd types incl.
+  `OwnedFd`) is in vm-memory's own `default` features, but every one of this workspace's `Cargo.toml`s sets
+  `default-features = false` and only re-adds `backend-mmap`. Fixed by adding `"rawfd"` to the features
+  list everywhere `vm-memory` is declared.
+- Validated: `cargo check` clean (zero errors) on `libkrun`, `krun-vmm`, `krun-arch`, `krun-kernel`,
+  `krun-smbios`, and `krun-devices --features gpu`. The only remaining failure in that combined check is
+  `krun-init-blob`'s build script (musl cross-link, `ld: unknown options --as-needed -Bstatic ...` from the
+  macOS host linker) — confirmed **pre-existing on fork `main` with zero patches**, unrelated to vm-memory.
+- Saved as `patches/libkrun/fork-branch-capivara-vm-memory-0-18/0001-*.patch`, re-appliable via `git am`
+  against fork `main`.
+
+**Still to decide**: how to combine this with `capivara/gfxstream-macos-base` (rebase one onto the other)
+before either gets pushed. The gfxstream branch's commit #1 already contains an unrelated pre-existing-bug
+fix layer; this vm-memory branch is a clean independent base, so rebasing gfxstream-macos-base onto it
+(replaying its 6 commits on top of `capivara/vm-memory-0.18` instead of `main`) is the straightforward
+path — not yet done.
+
 ## Not yet inventoried — needs its own pass
 
 This is real, load-bearing code, not yet ported anywhere:

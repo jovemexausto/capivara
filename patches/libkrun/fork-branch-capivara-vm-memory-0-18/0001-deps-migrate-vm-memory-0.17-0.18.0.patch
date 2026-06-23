@@ -1,0 +1,329 @@
+From 5fc25acd0365ce9915cfea26985e1ee99dca461f Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 16:52:54 -0300
+Subject: [PATCH] deps: migrate vm-memory 0.17 -> 0.18.0
+
+Unifies the workspace on vm-memory 0.18.0 (required by the gfxstream
+scaffolding, which uses GuestMemoryBackend). In 0.18, GuestMemory's
+default methods (get_slice, try_access, find_region, checked_offset,
+get_host_address, last_addr, address_in_range) moved to a new
+GuestMemoryBackend trait with a blanket impl; callers that imported
+only GuestMemory lose access to them. Fixed by importing
+GuestMemoryBackend alongside GuestMemory everywhere it's needed, plus
+one generic bound update in vsock/packet.rs::get_host_address.
+
+Also enables vm-memory's "rawfd" feature (in vm-memory's own default
+features, but stripped by this workspace's default-features = false),
+which is required for OwnedFd's WriteVolatile/ReadVolatile impls used
+by console/port_io/unix.rs.
+---
+ Cargo.lock                                   | 29 ++++++++++++++------
+ src/arch/Cargo.toml                          |  2 +-
+ src/devices/Cargo.toml                       |  2 +-
+ src/devices/src/virtio/balloon/device.rs     |  2 +-
+ src/devices/src/virtio/console/process_rx.rs |  2 +-
+ src/devices/src/virtio/console/process_tx.rs |  2 +-
+ src/devices/src/virtio/descriptor_utils.rs   |  2 +-
+ src/devices/src/virtio/gpu/virtio_gpu.rs     |  2 +-
+ src/devices/src/virtio/queue.rs              |  2 +-
+ src/devices/src/virtio/vsock/packet.rs       |  4 +--
+ src/kernel/Cargo.toml                        |  2 +-
+ src/kernel/src/loader/mod.rs                 |  2 +-
+ src/libkrun/Cargo.toml                       |  2 +-
+ src/smbios/Cargo.toml                        |  2 +-
+ src/vmm/Cargo.toml                           |  2 +-
+ 15 files changed, 35 insertions(+), 24 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index e45f67f..9589329 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -511,7 +511,7 @@ dependencies = [
+  "rustc_version",
+  "tokio",
+  "tracing",
+- "vm-memory",
++ "vm-memory 0.17.1",
+  "windows-sys",
+ ]
+ 
+@@ -626,7 +626,7 @@ dependencies = [
+  "libc",
+  "linux-loader",
+  "tdx",
+- "vm-memory",
++ "vm-memory 0.18.0",
+  "vmm-sys-util 0.15.0",
+  "windows-sys",
+ ]
+@@ -686,7 +686,7 @@ dependencies = [
+  "vhost",
+  "virtio-bindings",
+  "vm-fdt",
+- "vm-memory",
++ "vm-memory 0.18.0",
+  "vmm-sys-util 0.15.0",
+  "windows-sys",
+  "zerocopy",
+@@ -745,7 +745,7 @@ name = "krun-kernel"
+ version = "0.1.0-1.18.0"
+ dependencies = [
+  "krun-utils",
+- "vm-memory",
++ "vm-memory 0.18.0",
+ ]
+ 
+ [[package]]
+@@ -777,7 +777,7 @@ dependencies = [
+ name = "krun-smbios"
+ version = "0.1.0-1.18.0"
+ dependencies = [
+- "vm-memory",
++ "vm-memory 0.18.0",
+ ]
+ 
+ [[package]]
+@@ -824,7 +824,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "tdx",
+- "vm-memory",
++ "vm-memory 0.18.0",
+  "vmm-sys-util 0.14.0",
+  "windows-sys",
+  "zstd",
+@@ -893,7 +893,7 @@ dependencies = [
+  "log",
+  "nitro-enclaves 0.5.0",
+  "once_cell",
+- "vm-memory",
++ "vm-memory 0.18.0",
+  "windows-sys",
+ ]
+ 
+@@ -925,7 +925,7 @@ version = "0.13.2"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "de72cb02c55ecffcf75fe78295926f872eb6eb0a58d629c58a8c324dc26380f6"
+ dependencies = [
+- "vm-memory",
++ "vm-memory 0.17.1",
+ ]
+ 
+ [[package]]
+@@ -1604,7 +1604,7 @@ dependencies = [
+  "bitflags 2.11.0",
+  "libc",
+  "uuid",
+- "vm-memory",
++ "vm-memory 0.17.1",
+  "vmm-sys-util 0.15.0",
+ ]
+ 
+@@ -1637,6 +1637,17 @@ dependencies = [
+  "winapi",
+ ]
+ 
++[[package]]
++name = "vm-memory"
++version = "0.18.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9b55e753c7725603745cb32b2287ef7ef3da05c03c7702cda3fa8abe25ae0465"
++dependencies = [
++ "libc",
++ "thiserror 2.0.18",
++ "winapi",
++]
++
+ [[package]]
+ name = "vmm-sys-util"
+ version = "0.14.0"
+diff --git a/src/arch/Cargo.toml b/src/arch/Cargo.toml
+index 719c8fb..b92c102 100644
+--- a/src/arch/Cargo.toml
++++ b/src/arch/Cargo.toml
+@@ -14,7 +14,7 @@ tdx = [ "tee", "dep:tdx" ]
+ 
+ [dependencies]
+ libc = ">=0.2.39"
+-vm-memory = { version = "=0.17.1", default-features = false, features = ["backend-mmap"] }
++vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap", "rawfd"] }
+ vmm-sys-util = "0.15"
+ 
+ arch_gen = { package = "krun-arch-gen", version = "=0.1.0-1.18.0", path = "../arch_gen" }
+diff --git a/src/devices/Cargo.toml b/src/devices/Cargo.toml
+index fe8e4f3..a05a516 100644
+--- a/src/devices/Cargo.toml
++++ b/src/devices/Cargo.toml
+@@ -33,7 +33,7 @@ thiserror = { version = "2.0", optional = true }
+ vhost = { version = "0.15", optional = true, features = ["vhost-user-frontend"] }
+ vmm-sys-util = { version = "0.15", optional = true }
+ virtio-bindings = "0.2.0"
+-vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
++vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap", "rawfd"] }
+ zerocopy = { version = "0.8.26", optional = true, features = ["derive"] }
+ krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
+ krun_input = { package = "krun-input", version = "0.1.0", path = "../input", features = ["bindgen_clang_runtime"], optional = true }
+diff --git a/src/devices/src/virtio/balloon/device.rs b/src/devices/src/virtio/balloon/device.rs
+index 425c0b0..792e15b 100644
+--- a/src/devices/src/virtio/balloon/device.rs
++++ b/src/devices/src/virtio/balloon/device.rs
+@@ -3,7 +3,7 @@ use std::convert::TryInto;
+ use std::io::Write;
+ 
+ use utils::eventfd::EventFd;
+-use vm_memory::{ByteValued, GuestMemory, GuestMemoryMmap};
++use vm_memory::{ByteValued, GuestMemory, GuestMemoryBackend, GuestMemoryMmap};
+ 
+ use super::super::{
+     ActivateError, ActivateResult, BalloonError, DeviceQueue, DeviceState, QueueConfig,
+diff --git a/src/devices/src/virtio/console/process_rx.rs b/src/devices/src/virtio/console/process_rx.rs
+index dd0498c..1ed049e 100644
+--- a/src/devices/src/virtio/console/process_rx.rs
++++ b/src/devices/src/virtio/console/process_rx.rs
+@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::{io, thread};
+ 
+-use vm_memory::{GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
++use vm_memory::{GuestMemory, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+ 
+ use crate::virtio::console::console_control::ConsoleControl;
+ use crate::virtio::console::port_io::PortInput;
+diff --git a/src/devices/src/virtio/console/process_tx.rs b/src/devices/src/virtio/console/process_tx.rs
+index d1c7f69..84c2554 100644
+--- a/src/devices/src/virtio/console/process_tx.rs
++++ b/src/devices/src/virtio/console/process_tx.rs
+@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
+ use std::sync::{Arc, Mutex};
+ use std::{io, thread};
+ 
+-use vm_memory::{GuestMemory, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
++use vm_memory::{GuestMemory, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion};
+ 
+ use crate::virtio::console::port_io::PortOutput;
+ use crate::virtio::{DescriptorChain, InterruptTransport, Queue};
+diff --git a/src/devices/src/virtio/descriptor_utils.rs b/src/devices/src/virtio/descriptor_utils.rs
+index e19c4a5..aaaa2c3 100644
+--- a/src/devices/src/virtio/descriptor_utils.rs
++++ b/src/devices/src/virtio/descriptor_utils.rs
+@@ -13,7 +13,7 @@ use std::result;
+ 
+ use crate::virtio::queue::DescriptorChain;
+ use vm_memory::{
+-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
++    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
+     GuestMemoryRegion, Le16, Le32, Le64, VolatileMemory, VolatileMemoryError, VolatileSlice,
+ };
+ 
+diff --git a/src/devices/src/virtio/gpu/virtio_gpu.rs b/src/devices/src/virtio/gpu/virtio_gpu.rs
+index 67edb5f..164b0f3 100644
+--- a/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -38,7 +38,7 @@ use rutabaga_gfx::{
+ };
+ #[cfg(target_os = "macos")]
+ use utils::worker_message::WorkerMessage;
+-use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap, VolatileSlice};
++use vm_memory::{GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryMmap, VolatileSlice};
+ 
+ use super::{GpuError, Result};
+ use crate::virtio::display::DisplayInfo;
+diff --git a/src/devices/src/virtio/queue.rs b/src/devices/src/virtio/queue.rs
+index 6991aa6..85a372c 100644
+--- a/src/devices/src/virtio/queue.rs
++++ b/src/devices/src/virtio/queue.rs
+@@ -11,7 +11,7 @@ use std::num::Wrapping;
+ use std::sync::atomic::{Ordering, fence};
+ use virtio_bindings::virtio_ring::VRING_USED_F_NO_NOTIFY;
+ use vm_memory::{
+-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryError, GuestMemoryMmap,
++    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap,
+     VolatileMemoryError,
+ };
+ 
+diff --git a/src/devices/src/virtio/vsock/packet.rs b/src/devices/src/virtio/vsock/packet.rs
+index b7e23db..5c71ebc 100644
+--- a/src/devices/src/virtio/vsock/packet.rs
++++ b/src/devices/src/virtio/vsock/packet.rs
+@@ -27,7 +27,7 @@ use std::result;
+ use nix::sys::socket::{AddressFamily, sockaddr};
+ use nix::sys::socket::{SockaddrLike, SockaddrStorage};
+ use utils::byte_order;
+-use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryError};
++use vm_memory::{self, Address, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryError};
+ 
+ use super::super::DescriptorChain;
+ use super::defs;
+@@ -194,7 +194,7 @@ pub struct VsockPacket {
+     owned_buf: Option<Vec<u8>>,
+ }
+ 
+-fn get_host_address<T: GuestMemory>(
++fn get_host_address<T: GuestMemory + GuestMemoryBackend>(
+     mem: &T,
+     guest_addr: GuestAddress,
+     size: usize,
+diff --git a/src/kernel/Cargo.toml b/src/kernel/Cargo.toml
+index bf01bbe..fae448d 100644
+--- a/src/kernel/Cargo.toml
++++ b/src/kernel/Cargo.toml
+@@ -7,6 +7,6 @@ license = "Apache-2.0"
+ repository = "https://github.com/containers/libkrun"
+ 
+ [dependencies]
+-vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
++vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap", "rawfd"] }
+ 
+ utils = { package = "krun-utils", version = "=0.1.0-1.18.0", path = "../utils" }
+diff --git a/src/kernel/src/loader/mod.rs b/src/kernel/src/loader/mod.rs
+index 416fa5d..1f281cb 100644
+--- a/src/kernel/src/loader/mod.rs
++++ b/src/kernel/src/loader/mod.rs
+@@ -12,7 +12,7 @@ use std::ffi::CString;
+ use std::fmt;
+ 
+ use super::cmdline::Error as CmdlineError;
+-use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap};
++use vm_memory::{Address, Bytes, GuestAddress, GuestMemory, GuestMemoryBackend, GuestMemoryMmap};
+ 
+ #[derive(Debug, Eq, PartialEq)]
+ pub enum Error {
+diff --git a/src/libkrun/Cargo.toml b/src/libkrun/Cargo.toml
+index 468031c..a110a65 100644
+--- a/src/libkrun/Cargo.toml
++++ b/src/libkrun/Cargo.toml
+@@ -47,7 +47,7 @@ kvm-bindings = { version = "0.14", features = ["fam-wrappers"] }
+ kvm-ioctls = "0.24"
+ aws-nitro = { package = "krun-aws-nitro", version = "=0.1.0-1.18.0", path = "../aws_nitro", optional = true }
+ nitro-enclaves = { version = "0.5.0", optional = true }
+-vm-memory = { version = "=0.17.1", features = ["backend-mmap"] }
++vm-memory = { version = "0.18.0", features = ["backend-mmap", "rawfd"] }
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
+ windows-sys = { version = "0.61.2", features = [
+diff --git a/src/smbios/Cargo.toml b/src/smbios/Cargo.toml
+index f664ca1..6e36b72 100644
+--- a/src/smbios/Cargo.toml
++++ b/src/smbios/Cargo.toml
+@@ -7,4 +7,4 @@ license = "Apache-2.0"
+ repository = "https://github.com/containers/libkrun"
+ 
+ [dependencies]
+-vm-memory = { version = "0.17", default-features = false, features = ["backend-mmap"] }
++vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap", "rawfd"] }
+diff --git a/src/vmm/Cargo.toml b/src/vmm/Cargo.toml
+index e8dc4bd..488fd47 100644
+--- a/src/vmm/Cargo.toml
++++ b/src/vmm/Cargo.toml
+@@ -25,7 +25,7 @@ flate2 = "1.0.35"
+ libc = ">=0.2.39"
+ linux-loader = { version = "0.13.2", features = ["bzimage", "elf", "pe"] }
+ log = "0.4.0"
+-vm-memory = { version = "0.17.0", default-features = false, features = ["backend-mmap"] }
++vm-memory = { version = "0.18.0", default-features = false, features = ["backend-mmap", "rawfd"] }
+ vmm-sys-util = "0.14"
+ krun_display = { package = "krun-display", version = "0.1.0", path = "../display", optional = true, features = ["bindgen_clang_runtime"] }
+ krun_input = { package = "krun-input", version = "0.1.0", path = "../input", optional = true, features = ["bindgen_clang_runtime"] }
+-- 
+2.53.0
+
