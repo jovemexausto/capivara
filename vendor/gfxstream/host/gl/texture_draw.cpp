@@ -24,6 +24,7 @@
 
 #include "OpenGLESDispatch/DispatchTables.h"
 #include "gfxstream/common/logging.h"
+#include "gles_version_detector.h"
 
 #ifndef NDEBUG
 #define DEBUG_TEXTURE_DRAW
@@ -82,6 +83,7 @@ GLuint createShader(GLint shaderType, const char* shaderText) {
 //  shader; anyway the new code has hardcoded texture coordinate mapping for
 //  different rotation angles and works in both native OpenGL and SwiftShader.
 const char kVertexShaderSource[] =
+    "#version 100\n"
     "attribute vec2 position;\n"
     "attribute vec2 inCoord;\n"
     "varying vec2 outCoord;\n"
@@ -96,8 +98,32 @@ const char kVertexShaderSource[] =
     "  outCoord = inCoord * coordScale + coordTranslation;\n"
     "}\n";
 
+// `attribute`/`varying` are only valid up to GLSL(ES) 1.00; `shouldEnableCoreProfile()`
+// requests a GLES3+ context whenever the detected dispatch version is 3+, and this
+// internal blit shader needs a GLSL ES 3.00-compatible variant for that case --
+// otherwise glCompileShader fails and GFXSTREAM_FATAL aborts the process. (The host
+// GL implementation observed here reports itself as GLSL ES regardless of whether a
+// desktop "core profile" EGL context was requested, hence `es` here rather than the
+// desktop `core` GLSL dialect.)
+const char kVertexShaderSourceCore[] =
+    "#version 300 es\n"
+    "in vec2 position;\n"
+    "in vec2 inCoord;\n"
+    "out vec2 outCoord;\n"
+    "uniform vec2 translation;\n"
+    "uniform vec2 scale;\n"
+    "uniform vec2 coordTranslation;\n"
+    "uniform vec2 coordScale;\n"
+
+    "void main(void) {\n"
+    "  gl_Position.xy = position.xy * scale.xy - translation.xy;\n"
+    "  gl_Position.zw = vec2(0.0, 1.0);\n"
+    "  outCoord = inCoord * coordScale + coordTranslation;\n"
+    "}\n";
+
 // Similarly, just interpolate texture coordinates.
 const char kFragmentShaderSource[] =
+    "#version 100\n"
     "#define HWC2_COMPOSITION_DEVICE 2\n"
     "precision mediump float;\n"
     "varying lowp vec2 outCoord;\n"
@@ -116,6 +142,33 @@ const char kFragmentShaderSource[] =
     "  }\n"
     "  outColor = colorTransform * outColor;\n"
     "  gl_FragColor = outColor;\n"
+    "}\n";
+
+// Core-profile counterpart of kFragmentShaderSource: no default float
+// precision qualifiers, `in` instead of `varying`, `texture()` instead of the
+// removed `texture2D()`, and an explicit `out vec4` instead of the removed
+// `gl_FragColor` builtin.
+const char kFragmentShaderSourceCore[] =
+    "#version 300 es\n"
+    "#define HWC2_COMPOSITION_DEVICE 2\n"
+    "precision mediump float;\n"
+    "in vec2 outCoord;\n"
+    "uniform sampler2D tex;\n"
+    "uniform float alpha;\n"
+    "uniform int composeMode;\n"
+    "uniform vec4 color ;\n"
+    "uniform mat4 colorTransform;\n"
+    "out vec4 fragColor;\n"
+
+    "void main(void) {\n"
+    "  vec4 outColor;\n"
+    "  if (composeMode == HWC2_COMPOSITION_DEVICE) {\n"
+    "    outColor = alpha * texture(tex, outCoord);\n"
+    "  } else {\n"
+    "    outColor = alpha * color;\n"
+    "  }\n"
+    "  outColor = colorTransform * outColor;\n"
+    "  fragColor = outColor;\n"
     "}\n";
 
 static const GLfloat kIdentityMatrix[16] = {
@@ -203,8 +256,11 @@ TextureDraw::TextureDraw()
       mTranslationSlot(-1),
       mColorTransform(-1) {
     // Create shaders and program.
-    mVertexShader = createShader(GL_VERTEX_SHADER, kVertexShaderSource);
-    mFragmentShader = createShader(GL_FRAGMENT_SHADER, kFragmentShaderSource);
+    const bool coreProfile = shouldEnableCoreProfile();
+    mVertexShader = createShader(GL_VERTEX_SHADER,
+                                 coreProfile ? kVertexShaderSourceCore : kVertexShaderSource);
+    mFragmentShader = createShader(GL_FRAGMENT_SHADER,
+                                   coreProfile ? kFragmentShaderSourceCore : kFragmentShaderSource);
 
     mProgram = s_gles2.glCreateProgram();
     s_gles2.glAttachShader(mProgram, mVertexShader);
