@@ -1,0 +1,165 @@
+From 8e27d9217dbcb624aa56e648b20a955721171314 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 15:33:30 -0300
+Subject: [PATCH] gpu: revert use_gles default, fix texture_draw.cpp shader
+ pragmas for GLSL ES
+
+Investigated the composer3/renderControl GLES decoder path further (see
+prior two commits). Two findings, one fix applied, one root cause still
+open:
+
+1. virtio_gpu.rs's use_gles(true) (from the prior commit) was tested
+   against the actual libgfxstream_backend.dylib shipped in this repo,
+   which is still the original Vulkan-only build
+   (GFXSTREAM_ENABLE_HOST_GLES=0). Requesting GLES against that dylib
+   doesn't no-op -- stream_renderer_init fails outright ("Failed to
+   initialize renderer."), regressing the otherwise-working Vulkan/ASG
+   boot path documented in the first two commits. Reverted to
+   use_gles(false) to restore the known-good baseline (verified:
+   "Gfxstream initialized successfully!" reappears).
+
+2. Traced why the GLES-enabled experimental build (-Ddecoders=vulkan,gles,
+   composer, not the default here) still doesn't get composer3 working
+   even with use_egl(false)/use_gles(true) selecting the native
+   egl_os_api_darwin.cpp path as intended: that "native" path turns out to
+   be backed by GLSL ES 3.0 through what's apparently Apple's own internal
+   ANGLE-over-Metal shim (GL_VERSION "OpenGL ES 3.0 (2.1 Metal - 90.5)",
+   GL_VENDOR "Google (Apple)") -- not the raw NSOpenGL/CGL calls in
+   mac_native.m as the code's own comments assume. gfxstream's internal
+   blit shader (texture_draw.cpp, used to composite guest framebuffers)
+   was hardcoded GLSL ES 1.00-style (`attribute`/`varying`, no #version
+   pragma) with no profile-aware variant. Tried #version 120 (desktop) and
+   #version 100 (ES) on the legacy path -- both fail identically, with an
+   empty info log on glGetShaderiv(GL_COMPILE_STATUS), so the actual
+   blocker isn't the version pragma; root cause not yet found.
+
+texture_draw.cpp changes kept despite the open root cause, since they're
+real, independent fixes:
+- The kVertexShaderSourceCore/kFragmentShaderSourceCore variants (added in
+  the prior commit for shouldEnableCoreProfile()'s GLES3+ path) used
+  desktop GLSL `#version 150`. Given the GL implementation observed here
+  is GLSL ES regardless of which EGL profile bit was requested, switched
+  both to `#version 300 es` (matching the `in`/`out`/`texture()` syntax
+  they already use, which is valid GLSL ES 300 as well as desktop 150).
+- Removed temporary fprintf diagnostics used to capture the GL_VERSION /
+  glGetError() trail above (kept out of the final patch; not needed by
+  future debugging since the underlying GL implementation identity is now
+  documented in the comment).
+
+Net effect: this repo's default Vulkan-only boot path is unaffected and
+confirmed still working. The GLES decoder build remains available for
+experimentation (vendor/gfxstream/build-macos-gles-test/) but is not the
+default, and composer3's renderControl path is still blocked --
+specifically on why this internal blit shader fails to compile under
+Apple's ANGLE-over-Metal GLES with no diagnostic info, independent of
+shader syntax/version pragma choice.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ vendor/gfxstream/host/gl/texture_draw.cpp | 60 ++++++++++++++++++++++-
+ 1 file changed, 58 insertions(+), 2 deletions(-)
+
+diff --git a/vendor/gfxstream/host/gl/texture_draw.cpp b/vendor/gfxstream/host/gl/texture_draw.cpp
+index f8e2c46..4f0152a 100644
+--- a/vendor/gfxstream/host/gl/texture_draw.cpp
++++ b/vendor/gfxstream/host/gl/texture_draw.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include "OpenGLESDispatch/DispatchTables.h"
+ #include "gfxstream/common/logging.h"
++#include "gles_version_detector.h"
+ 
+ #ifndef NDEBUG
+ #define DEBUG_TEXTURE_DRAW
+@@ -82,6 +83,7 @@ GLuint createShader(GLint shaderType, const char* shaderText) {
+ //  shader; anyway the new code has hardcoded texture coordinate mapping for
+ //  different rotation angles and works in both native OpenGL and SwiftShader.
+ const char kVertexShaderSource[] =
++    "#version 100\n"
+     "attribute vec2 position;\n"
+     "attribute vec2 inCoord;\n"
+     "varying vec2 outCoord;\n"
+@@ -96,8 +98,32 @@ const char kVertexShaderSource[] =
+     "  outCoord = inCoord * coordScale + coordTranslation;\n"
+     "}\n";
+ 
++// `attribute`/`varying` are only valid up to GLSL(ES) 1.00; `shouldEnableCoreProfile()`
++// requests a GLES3+ context whenever the detected dispatch version is 3+, and this
++// internal blit shader needs a GLSL ES 3.00-compatible variant for that case --
++// otherwise glCompileShader fails and GFXSTREAM_FATAL aborts the process. (The host
++// GL implementation observed here reports itself as GLSL ES regardless of whether a
++// desktop "core profile" EGL context was requested, hence `es` here rather than the
++// desktop `core` GLSL dialect.)
++const char kVertexShaderSourceCore[] =
++    "#version 300 es\n"
++    "in vec2 position;\n"
++    "in vec2 inCoord;\n"
++    "out vec2 outCoord;\n"
++    "uniform vec2 translation;\n"
++    "uniform vec2 scale;\n"
++    "uniform vec2 coordTranslation;\n"
++    "uniform vec2 coordScale;\n"
++
++    "void main(void) {\n"
++    "  gl_Position.xy = position.xy * scale.xy - translation.xy;\n"
++    "  gl_Position.zw = vec2(0.0, 1.0);\n"
++    "  outCoord = inCoord * coordScale + coordTranslation;\n"
++    "}\n";
++
+ // Similarly, just interpolate texture coordinates.
+ const char kFragmentShaderSource[] =
++    "#version 100\n"
+     "#define HWC2_COMPOSITION_DEVICE 2\n"
+     "precision mediump float;\n"
+     "varying lowp vec2 outCoord;\n"
+@@ -118,6 +144,33 @@ const char kFragmentShaderSource[] =
+     "  gl_FragColor = outColor;\n"
+     "}\n";
+ 
++// Core-profile counterpart of kFragmentShaderSource: no default float
++// precision qualifiers, `in` instead of `varying`, `texture()` instead of the
++// removed `texture2D()`, and an explicit `out vec4` instead of the removed
++// `gl_FragColor` builtin.
++const char kFragmentShaderSourceCore[] =
++    "#version 300 es\n"
++    "#define HWC2_COMPOSITION_DEVICE 2\n"
++    "precision mediump float;\n"
++    "in vec2 outCoord;\n"
++    "uniform sampler2D tex;\n"
++    "uniform float alpha;\n"
++    "uniform int composeMode;\n"
++    "uniform vec4 color ;\n"
++    "uniform mat4 colorTransform;\n"
++    "out vec4 fragColor;\n"
++
++    "void main(void) {\n"
++    "  vec4 outColor;\n"
++    "  if (composeMode == HWC2_COMPOSITION_DEVICE) {\n"
++    "    outColor = alpha * texture(tex, outCoord);\n"
++    "  } else {\n"
++    "    outColor = alpha * color;\n"
++    "  }\n"
++    "  outColor = colorTransform * outColor;\n"
++    "  fragColor = outColor;\n"
++    "}\n";
++
+ static const GLfloat kIdentityMatrix[16] = {
+     1.0f, 0.0f, 0.0f, 0.0f,
+     0.0f, 1.0f, 0.0f, 0.0f,
+@@ -203,8 +256,11 @@ TextureDraw::TextureDraw()
+       mTranslationSlot(-1),
+       mColorTransform(-1) {
+     // Create shaders and program.
+-    mVertexShader = createShader(GL_VERTEX_SHADER, kVertexShaderSource);
+-    mFragmentShader = createShader(GL_FRAGMENT_SHADER, kFragmentShaderSource);
++    const bool coreProfile = shouldEnableCoreProfile();
++    mVertexShader = createShader(GL_VERTEX_SHADER,
++                                 coreProfile ? kVertexShaderSourceCore : kVertexShaderSource);
++    mFragmentShader = createShader(GL_FRAGMENT_SHADER,
++                                   coreProfile ? kFragmentShaderSourceCore : kFragmentShaderSource);
+ 
+     mProgram = s_gles2.glCreateProgram();
+     s_gles2.glAttachShader(mProgram, mVertexShader);
+-- 
+2.53.0
+

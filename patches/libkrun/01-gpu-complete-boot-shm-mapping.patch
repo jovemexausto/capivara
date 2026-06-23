@@ -1,0 +1,294 @@
+From 35e41291922fbfdd2fe40c473dc377e5d4b6527d Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Mon, 22 Jun 2026 19:58:55 -0300
+Subject: [PATCH] gpu: complete Android boot with gfxstream/ASG Vulkan on
+ libkrun/HVF macOS
+
+First full Android boot (sys.boot_completed=1) over libkrun/HVF on macOS
+with hardware-accelerated Vulkan via gfxstream (ranchu/ASG). The ranchu
+path failed in layers; each fix unblocked the next, traced via GPU worker
+instrumentation, ANR backtraces, and host panics.
+
+virtio_gpu.rs:
+- new_gfxstream: plumb the real map_sender instead of a channel whose
+  receiver was dropped. After the gfxstream blob map_ptr was populated,
+  resource_map_blob reaches WorkerMessage::GpuAddMapping (hv_vm_map); the
+  dead stub channel made send().unwrap() panic the GPU worker, hanging the
+  guest's DRM_IOCTL_VIRTGPU_WAIT during ASG ring setup.
+- transfer_read: implement by delegating to rutabaga.transfer_read instead
+  of panicking; gfxstream's ASG ring issues TRANSFER_FROM_HOST_3D to read
+  host-produced ring data back.
+
+worker.rs:
+- pass map_sender into new_gfxstream; drop temporary command-trace logging.
+
+capy/main.rs:
+- add androidboot.vsock_lights_port=6800. The cuttlefish lights HAL binds
+  an AF_VSOCK listener on this port; absent the property it binds port 0,
+  fails with EACCES and panics, leaving the VINTF-declared ILights service
+  unregistered. system_server then blocks in waitForDeclaredService until
+  Watchdog kills it, crash-looping zygote and blocking boot_completed.
+
+Builds on the already-committed gfxstream map_ptr mmap fix (rutabaga
+gfxstream create_blob) and createBlob error propagation.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../src/devices/src/virtio/gpu/virtio_gpu.rs  | 132 ++++++++----------
+ .../src/devices/src/virtio/gpu/worker.rs      |  48 +------
+ 2 files changed, 63 insertions(+), 117 deletions(-)
+
+diff --git a/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs b/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs
+index 74f3955..284cb3a 100644
+--- a/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -400,14 +400,18 @@ impl VirtioGpu {
+ 
+     /// Variant of [`new`] for the macOS + gfxstream (Vulkan-only) path.
+     ///
+-    /// Does not need `virgl_flags` or a `map_sender`; creates the Rutabaga
+-    /// instance via `create_rutabaga_gfxstream` and falls back to a headless
+-    /// 2-D renderer if that fails.
++    /// Does not need `virgl_flags`; creates the Rutabaga instance via
++    /// `create_rutabaga_gfxstream` and falls back to a headless 2-D renderer if
++    /// that fails. The `map_sender` is required: gfxstream's ASG ring buffer is a
++    /// HOST3D blob that `resource_map_blob` maps into the guest via
++    /// `WorkerMessage::GpuAddMapping` (hv_vm_map), so the channel must be the live
++    /// one serviced by the vmm worker, not a disconnected stub.
+     #[cfg(all(target_os = "macos", feature = "gpu-gfxstream"))]
+     pub fn new_gfxstream(
+         mem: GuestMemoryMmap,
+         queue_ctl: Arc<Mutex<VirtQueue>>,
+         interrupt: InterruptTransport,
++        map_sender: Sender<WorkerMessage>,
+         export_table: Option<ExportTable>,
+         displays: Box<[DisplayInfo]>,
+         display_backend: DisplayBackend,
+@@ -453,13 +457,7 @@ impl VirtioGpu {
+             displays,
+             display_backend,
+             #[cfg(target_os = "macos")]
+-            map_sender: {
+-                // new_gfxstream does not need a map_sender (no Metal external
+-                // memory import via virglrenderer); use an unbounded channel
+-                // that satisfies the struct field but is never consumed.
+-                let (tx, _rx) = unbounded();
+-                tx
+-            },
++            map_sender,
+         }
+     }
+ 
+@@ -697,12 +695,23 @@ impl VirtioGpu {
+     /// Can also be used to invalidate caches.
+     pub fn transfer_read(
+         &mut self,
+-        _ctx_id: u32,
+-        _resource_id: u32,
+-        _transfer: Transfer3D,
+-        _buf: Option<VolatileSlice>,
++        ctx_id: u32,
++        resource_id: u32,
++        transfer: Transfer3D,
++        buf: Option<VolatileSlice>,
+     ) -> VirtioGpuResult {
+-        panic!("virtio_gpu: transfer_read unimplemented");
++        // gfxstream's ASG ring relies on TRANSFER_FROM_HOST_3D to read host-produced
++        // data back (e.g. the ring's read pointer / response area). The control-queue
++        // call path passes `buf: None`, transferring into the resource's own backing;
++        // support an explicit destination slice too for completeness.
++        let buf = buf.map(|s| {
++            // SAFETY: the volatile slice points at a live, correctly-sized guest
++            // mapping for the duration of this call.
++            unsafe { IoSliceMut::new(std::slice::from_raw_parts_mut(s.ptr_guard_mut().as_ptr(), s.len())) }
++        });
++        self.rutabaga
++            .transfer_read(ctx_id, resource_id, transfer, buf)?;
++        Ok(OkNoData)
+     }
+ 
+     /// Attaches backing memory to the given resource, represented by a `Vec` of `(address, size)`
+@@ -1013,71 +1022,50 @@ impl VirtioGpu {
+             .get_mut(&resource_id)
+             .ok_or(ErrInvalidResourceId)?;
+ 
+-        let map_info = match self.rutabaga.map_info(resource_id) {
+-            Ok(v) => v,
+-            Err(e) => {
+-                eprintln!("[capy-trace] resource_map_blob: map_info FAILED resource_id={resource_id} err={e:?}");
+-                return Err(ErrUnspec);
+-            }
+-        };
+-        let map_ptr = match self.rutabaga.map_ptr(resource_id) {
+-            Ok(v) => v,
+-            Err(e) => {
+-                eprintln!("[capy-trace] resource_map_blob: map_ptr FAILED resource_id={resource_id} err={e:?}");
+-                return Err(ErrUnspec);
+-            }
+-        };
++        let map_info = self.rutabaga.map_info(resource_id).map_err(|_| ErrUnspec)?;
++        let map_ptr = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)?;
+ 
+-        match self.rutabaga.export_blob(resource_id) {
+-            Ok(export) => {
+-                eprintln!(
+-                    "[capy-trace] resource_map_blob: export OK handle_type={} map_ptr={:x}",
+-                    export.handle_type, map_ptr
+-                );
++        if let Ok(export) = self.rutabaga.export_blob(resource_id) {
++            debug!(
++                "resource_map_blob: export handle_type={} map_ptr={:x}",
++                export.handle_type, map_ptr
++            );
+ 
+-                if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
+-                    || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
+-                {
+-                    if offset + resource.size > shm_region.size as u64 {
+-                        eprintln!(
+-                            "[capy-trace] resource_map_blob: DOES NOT FIT offset={offset} size={} shm_region.size={}",
+-                            resource.size, shm_region.size
+-                        );
+-                        return Err(ErrUnspec);
+-                    }
++            if export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_APPLE
++                || export.handle_type == RUTABAGA_MEM_HANDLE_TYPE_SHM
++            {
++                if offset + resource.size > shm_region.size as u64 {
++                    error!("mapping DOES NOT FIT");
++                    return Err(ErrUnspec);
++                }
+ 
+-                    let guest_addr = shm_region.guest_addr + offset;
+-                    eprintln!(
+-                        "[capy-trace] resource_map_blob: mapping map_ptr={:x} guest_addr={:x} size={}",
+-                        map_ptr, guest_addr, resource.size
+-                    );
++                let guest_addr = shm_region.guest_addr + offset;
++                debug!(
++                    "mapping: map_ptr={:x}, guest_addr={:x}, size={}",
++                    map_ptr, guest_addr, resource.size
++                );
+ 
+-                    let (reply_sender, reply_receiver) = unbounded();
+-                    self.map_sender
+-                        .send(WorkerMessage::GpuAddMapping(
+-                            reply_sender,
+-                            map_ptr,
+-                            guest_addr,
+-                            resource.size,
+-                        ))
+-                        .unwrap();
+-                    let ok = reply_receiver.recv().unwrap();
+-                    eprintln!("[capy-trace] resource_map_blob: GpuAddMapping reply={ok}");
+-                    if !ok {
+-                        return Err(ErrUnspec);
+-                    }
+-                } else {
+-                    eprintln!(
+-                        "[capy-trace] resource_map_blob: unsupported export handle_type={} for resource {}",
+-                        export.handle_type, resource_id
+-                    );
++                let (reply_sender, reply_receiver) = unbounded();
++                self.map_sender
++                    .send(WorkerMessage::GpuAddMapping(
++                        reply_sender,
++                        map_ptr,
++                        guest_addr,
++                        resource.size,
++                    ))
++                    .unwrap();
++                if !reply_receiver.recv().unwrap() {
+                     return Err(ErrUnspec);
+                 }
+-            }
+-            Err(e) => {
+-                eprintln!("[capy-trace] resource_map_blob: export_blob FAILED resource_id={resource_id} err={e:?}");
++            } else {
++                error!(
++                    "resource_map_blob: unsupported export handle_type={} for resource {}",
++                    export.handle_type, resource_id
++                );
+                 return Err(ErrUnspec);
+             }
++        } else {
++            return Err(ErrUnspec);
+         }
+ 
+         resource.shmem_offset = Some(offset);
+diff --git a/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs b/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs
+index 58e92d2..109d7a1 100644
+--- a/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs
++++ b/vendor/libkrun/src/devices/src/virtio/gpu/worker.rs
+@@ -95,6 +95,7 @@ impl Worker {
+             self.mem.clone(),
+             self.control_queue.clone(),
+             self.interrupt.clone(),
++            self.map_sender.clone(),
+             self.export_table.take(),
+             self.displays.clone(),
+             self.display_backend,
+@@ -135,48 +136,7 @@ impl Worker {
+     ) -> VirtioGpuResult {
+         virtio_gpu.force_ctx_0();
+ 
+-        let cmd_name = match &cmd {
+-            GpuCommand::GetDisplayInfo => "GetDisplayInfo",
+-            GpuCommand::GetEdid(_) => "GetEdid",
+-            GpuCommand::ResourceCreate2d(_) => "ResourceCreate2d",
+-            GpuCommand::ResourceUnref(_) => "ResourceUnref",
+-            GpuCommand::SetScanout(_) => "SetScanout",
+-            GpuCommand::SetScanoutBlob(_) => "SetScanoutBlob",
+-            GpuCommand::ResourceFlush(_) => "ResourceFlush",
+-            GpuCommand::TransferToHost2d(_) => "TransferToHost2d",
+-            GpuCommand::ResourceAttachBacking(_) => "ResourceAttachBacking",
+-            GpuCommand::ResourceDetachBacking(_) => "ResourceDetachBacking",
+-            GpuCommand::GetCapsetInfo(_) => "GetCapsetInfo",
+-            GpuCommand::GetCapset(_) => "GetCapset",
+-            GpuCommand::CtxCreate(_) => "CtxCreate",
+-            GpuCommand::CtxDestroy(_) => "CtxDestroy",
+-            GpuCommand::CtxAttachResource(_) => "CtxAttachResource",
+-            GpuCommand::CtxDetachResource(_) => "CtxDetachResource",
+-            GpuCommand::ResourceCreate3d(_) => "ResourceCreate3d",
+-            GpuCommand::TransferToHost3d(_) => "TransferToHost3d",
+-            GpuCommand::TransferFromHost3d(_) => "TransferFromHost3d",
+-            GpuCommand::CmdSubmit3d(_) => "CmdSubmit3d",
+-            GpuCommand::ResourceCreateBlob(info) => {
+-                eprintln!(
+-                    "[capy-trace] ResourceCreateBlob resource_id={} blob_mem={} blob_flags={} size={} nr_entries={}",
+-                    info.resource_id, info.blob_mem, info.blob_flags, info.size, info.nr_entries
+-                );
+-                "ResourceCreateBlob"
+-            }
+-            GpuCommand::ResourceMapBlob(info) => {
+-                eprintln!(
+-                    "[capy-trace] ResourceMapBlob resource_id={} offset={}",
+-                    info.resource_id, info.offset
+-                );
+-                "ResourceMapBlob"
+-            }
+-            GpuCommand::ResourceUnmapBlob(_) => "ResourceUnmapBlob",
+-            GpuCommand::UpdateCursor(_) => "UpdateCursor",
+-            GpuCommand::MoveCursor(_) => "MoveCursor",
+-            GpuCommand::ResourceAssignUuid(_) => "ResourceAssignUuid",
+-        };
+-        eprintln!("[capy-trace] cmd={cmd_name} ctx_id={}", hdr.ctx_id);
+-        let result = match cmd {
++        match cmd {
+             GpuCommand::GetDisplayInfo => virtio_gpu.display_info(),
+             GpuCommand::GetEdid(info) => virtio_gpu.get_edid(info.scanout),
+             GpuCommand::ResourceCreate2d(info) => {
+@@ -396,9 +356,7 @@ impl Worker {
+                 let resource_id = info.resource_id;
+                 virtio_gpu.resource_unmap_blob(resource_id, &self.shm_region)
+             }
+-        };
+-        eprintln!("[capy-trace] result={result:?}");
+-        result
++        }
+     }
+ 
+     fn process_queue(
+-- 
+2.53.0
+

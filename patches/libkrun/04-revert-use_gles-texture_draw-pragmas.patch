@@ -1,0 +1,117 @@
+From 8e27d9217dbcb624aa56e648b20a955721171314 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Tue, 23 Jun 2026 15:33:30 -0300
+Subject: [PATCH] gpu: revert use_gles default, fix texture_draw.cpp shader
+ pragmas for GLSL ES
+
+Investigated the composer3/renderControl GLES decoder path further (see
+prior two commits). Two findings, one fix applied, one root cause still
+open:
+
+1. virtio_gpu.rs's use_gles(true) (from the prior commit) was tested
+   against the actual libgfxstream_backend.dylib shipped in this repo,
+   which is still the original Vulkan-only build
+   (GFXSTREAM_ENABLE_HOST_GLES=0). Requesting GLES against that dylib
+   doesn't no-op -- stream_renderer_init fails outright ("Failed to
+   initialize renderer."), regressing the otherwise-working Vulkan/ASG
+   boot path documented in the first two commits. Reverted to
+   use_gles(false) to restore the known-good baseline (verified:
+   "Gfxstream initialized successfully!" reappears).
+
+2. Traced why the GLES-enabled experimental build (-Ddecoders=vulkan,gles,
+   composer, not the default here) still doesn't get composer3 working
+   even with use_egl(false)/use_gles(true) selecting the native
+   egl_os_api_darwin.cpp path as intended: that "native" path turns out to
+   be backed by GLSL ES 3.0 through what's apparently Apple's own internal
+   ANGLE-over-Metal shim (GL_VERSION "OpenGL ES 3.0 (2.1 Metal - 90.5)",
+   GL_VENDOR "Google (Apple)") -- not the raw NSOpenGL/CGL calls in
+   mac_native.m as the code's own comments assume. gfxstream's internal
+   blit shader (texture_draw.cpp, used to composite guest framebuffers)
+   was hardcoded GLSL ES 1.00-style (`attribute`/`varying`, no #version
+   pragma) with no profile-aware variant. Tried #version 120 (desktop) and
+   #version 100 (ES) on the legacy path -- both fail identically, with an
+   empty info log on glGetShaderiv(GL_COMPILE_STATUS), so the actual
+   blocker isn't the version pragma; root cause not yet found.
+
+texture_draw.cpp changes kept despite the open root cause, since they're
+real, independent fixes:
+- The kVertexShaderSourceCore/kFragmentShaderSourceCore variants (added in
+  the prior commit for shouldEnableCoreProfile()'s GLES3+ path) used
+  desktop GLSL `#version 150`. Given the GL implementation observed here
+  is GLSL ES regardless of which EGL profile bit was requested, switched
+  both to `#version 300 es` (matching the `in`/`out`/`texture()` syntax
+  they already use, which is valid GLSL ES 300 as well as desktop 150).
+- Removed temporary fprintf diagnostics used to capture the GL_VERSION /
+  glGetError() trail above (kept out of the final patch; not needed by
+  future debugging since the underlying GL implementation identity is now
+  documented in the comment).
+
+Net effect: this repo's default Vulkan-only boot path is unaffected and
+confirmed still working. The GLES decoder build remains available for
+experimentation (vendor/gfxstream/build-macos-gles-test/) but is not the
+default, and composer3's renderControl path is still blocked --
+specifically on why this internal blit shader fails to compile under
+Apple's ANGLE-over-Metal GLES with no diagnostic info, independent of
+shader syntax/version pragma choice.
+
+Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>
+---
+ .../src/devices/src/virtio/gpu/virtio_gpu.rs  | 34 ++++++++++++-------
+ 1 file changed, 21 insertions(+), 13 deletions(-)
+
+diff --git a/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs b/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs
+index 2c01c45..db00ede 100644
+--- a/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs
++++ b/vendor/libkrun/src/devices/src/virtio/gpu/virtio_gpu.rs
+@@ -317,19 +317,27 @@ impl VirtioGpu {
+         display_width: u32,
+         display_height: u32,
+     ) -> Option<Rutabaga> {
+-        // Vulkan + GLES (composer3's renderControl path needs a real GLES
+-        // decoder on the host; gfxstream is built with -Ddecoders=vulkan,gles).
++        // Vulkan-only: configure via RutabagaBuilder fluent API.
+         //
+-        // use_egl(false) is deliberate even though GLES is enabled:
+-        // STREAM_RENDERER_FLAGS_USE_EGL_BIT maps to gfxstream's `EglOnEgl`
+-        // feature, which routes the GLES translator through `egl_os_api_egl.cpp`
+-        // -- a passthrough that dlopen()s a host libEGL.so/libGLESv2.so. Those
+-        // don't exist on macOS (no native EGL). With EglOnEgl off,
+-        // EglGlobalInfo picks the native Darwin backend instead
+-        // (egl_os_api_darwin.cpp's `Engine::createHostInstance()`, built on
+-        // mac_native.m's direct NSOpenGL/CGL calls) -- the one this platform
+-        // actually has. `use_gles(true)` is unaffected by this and still
+-        // enables the GLES decoder/capset.
++        // use_gles(false) matches the libgfxstream_backend.dylib actually
++        // shipped here (GFXSTREAM_ENABLE_HOST_GLES=0 / -Ddecoders=vulkan).
++        // Requesting use_gles(true) against that dylib doesn't get silently
++        // ignored -- stream_renderer_init fails outright ("Failed to
++        // initialize renderer.") because the GLES decoder it would need
++        // isn't compiled in.
++        //
++        // A `-Ddecoders=vulkan,gles,composer` build exists experimentally
++        // (see capivara-gfxstream-gles-host-build memory note) and does
++        // initialize with use_egl(false)+use_gles(true) -- EGL_BIT maps to
++        // gfxstream's `EglOnEgl` feature, which would otherwise route the
++        // GLES translator through egl_os_api_egl.cpp's dlopen of a host
++        // libEGL.so/libGLESv2.so that doesn't exist on macOS; EglOnEgl off
++        // picks the native egl_os_api_darwin.cpp path instead. But that path
++        // is GLSL ES 3.0 via Apple's internal ANGLE-over-Metal shim
++        // (GL_VENDOR "Google (Apple)"), and gfxstream's own internal blit
++        // shader (texture_draw.cpp) fails to compile under it with an empty
++        // info log regardless of #version pragma -- not yet root-caused, so
++        // that build isn't wired up as the default here.
+         let builder = RutabagaBuilder::new(
+             rutabaga_gfx::RutabagaComponentType::Gfxstream,
+             0, // virgl_flags — unused by gfxstream component
+@@ -338,7 +346,7 @@ impl VirtioGpu {
+         .set_display_width(display_width)
+         .set_display_height(display_height)
+         .set_use_egl(false)
+-        .set_use_gles(true)
++        .set_use_gles(false)
+         .set_use_glx(false)
+         .set_use_surfaceless(false)
+         .set_use_vulkan(true)
+-- 
+2.53.0
+
