@@ -1,7 +1,0 @@
-package(
-    default_visibility = ["//:gfxstream"],
-)
-
-exports_files([
-    "vk_lavapipe_icd.json",
-])

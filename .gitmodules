@@ -1,0 +1,6 @@
+[submodule "vendor/libkrun"]
+	path = vendor/libkrun
+	url = https://github.com/jovemexausto/libkrun.git
+[submodule "vendor/gfxstream"]
+	path = vendor/gfxstream
+	url = https://github.com/jovemexausto/gfxstream.git
