@@ -10,7 +10,7 @@ numbered `git format-patch` series — so nothing depends on the `/tmp` clone su
 apply cleanly with `git am patches/<repo>/*.patch` against the respective fork's `main`, and both have
 been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the fork clones.
 
-## libkrun — `capivara/macos-gfxstream-vulkan` (7 commits)
+## libkrun — `capivara/macos-gfxstream-vulkan` (8 commits)
 
 | # | Commit | What | Why it's there |
 |---|---|---|---|
@@ -21,13 +21,14 @@ been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the f
 | 0005 | `rutabaga_gfx/gfxstream: compute map_ptr for HOST3D blobs on macOS` | `mmap`s the SHM fd in `create_blob` so ASG/ranchu Vulkan gets a usable pointer. | **The single most important fix in this series** — first thing that made gfxstream/ASG work on macOS/HVF at all. |
 | 0006 | `virtio/gpu: wire the real map_sender into new_gfxstream on macOS` | Connects the real `map_sender` channel into `new_gfxstream` instead of the scaffolding's placeholder. | |
 | 0007 | `virtio/gpu: defer gfxstream TransferFromHost3d to break dispatcher deadlock` | One-shot helper thread defers blocking `TransferFromHost3d` reads off the single in-order dispatcher thread. | Fixes the dispatcher deadlock that blocked full Android boot. |
+| 0008 | `virtio/gpu: document that the GLES shader-compile blocker is now fixed` | Comment-only update in `create_rutabaga_gfxstream`'s `use_gles(false)` rationale, pointing at the real fix (gfxstream 0006-0008) instead of the disproven ANGLE-over-Metal hypothesis. `use_gles` still defaults to `false` pending a real Android-guest boot test (only tested against a minimal `/bin/sh` root so far, via a temporary diagnostic edit, reverted). | Keeps the comment from misleading whoever reads it next. |
 
 **Validated**: `cargo check` clean for `libkrun`, `krun-vmm`, `krun-arch`, `krun-kernel`, `krun-smbios`,
 `krun-devices --features gpu-gfxstream`, and `krun-rutabaga-gfx --features gfxstream`. The only failure
 anywhere in the tree is `krun-init-blob`'s build script (musl cross-link, macOS host linker) — confirmed
 pre-existing on fork `main` with zero patches applied.
 
-## gfxstream — `capivara/macos-gfxstream-build` (7 commits)
+## gfxstream — `capivara/macos-gfxstream-build` (8 commits)
 
 Built from fork `main`, starting with the 2 commits that were the old, narrower `capivara/macos-shm-fix`
 PR branch (kept — they're real and unrelated to the rest), then 3 new commits hand-extracted this pass:
@@ -40,16 +41,21 @@ PR branch (kept — they're real and unrelated to the rest), then 3 new commits 
 | 0004 | `host: fix macOS build for decoders=vulkan,gles,composer` | 7 real bugs blocking the GLES/composer decoders on top of 0003's Vulkan-only base: missing brace, 3 duplicate function defs, missing `getConfigs` wrapper, missing `objcpp_args` (so `.mm` files never saw `GFXSTREAM_ENABLE_HOST_GLES`), conditional macOS frameworks for GLES. | Session work. |
 | 0005 | `host/gl/texture_draw: use GLSL ES 3.00 pragmas under the GLES decoder` | Adds GLSL ES 3.00 core-profile shader variants for the blit shaders. | Session work. Superseded as the "why GLES doesn't work" diagnosis by 0006/0007 below — the real blocker was never the `#version` pragma or ANGLE-over-Metal (that hypothesis was investigated and disproved with direct Metal/OpenGL.framework compile tests); it was `USE_ANGLE_SHADER_PARSER` never being wired into the Meson build, and the ANGLE shader translator never being vendored at all. See `capivara-gles-shader-translator-missing` memory for the full diagnosis trail. |
 | 0006 | `third_party/angle: fix macOS coverage gaps in Bazel build glue` | `angle_common`/`angle_glslang`'s `select()`s on `@platforms//os` only had linux/windows branches (one had no default, the other silently always picked the linux source unconditionally). Added macOS branches + `//conditions:default` fallbacks. | **Generic Bazel+macOS bug, not Capivara-specific — good upstream candidate.** Verified with a full `bazel clean --expunge` + rebuild of `@angle//:translator` using only this tracked `BUILD.angle.bazel`, no local ANGLE checkout needed (`git_repository()` fetches its own copy at the pinned commit `8b39631d6ab5a2efa21629c6fa94a80381720950`). |
-| 0007 | `host/gl: implement the missing angle_shader_translator C ABI` | New `ShaderTranslator.{h,cpp}` — the flat C ABI (`ST_*`) that `angle_shader_parser.cpp` `dlopen()`s as `libshadertranslator.{dylib,so,dll}` at runtime, wrapping ANGLE's real `sh::*` API. This file never existed anywhere (not in gfxstream, not in vanilla ANGLE, not in this fork's history) — `CMakeLists.txt` literally says the caller is responsible for providing it, and no caller ever did. Built as a standalone `cc_shared_library` via Bazel (`//host/gl/glestranslator/gles_v2:shadertranslator`), copied next to `libgfxstream_backend` by a Meson `custom_target` gated on `decoders=gles`. | Session work. **Capivara-authored, not yet boot-validated** — confirmed the full build links clean and a standalone `dlopen`/`dlsym`/call test of `STInitialize()` succeeds, but the actual shader compile/link path through a real Android boot is untested. Hold off upstreaming until that validation happens; the design (flat-POD ABI mirroring ANGLE's reflection types) is sound but the exact field set in `ST_ShaderVariable`/`ST_InterfaceBlock` was derived from gfxstream's own consumers (`program_data.cpp`), not from any reference implementation, so it may need a field or two more once exercised by real shaders. |
-
+| 0007 | `host/gl: implement the missing angle_shader_translator C ABI` | New `ShaderTranslator.{h,cpp}` — the flat C ABI (`ST_*`) that `angle_shader_parser.cpp` `dlopen()`s as `libshadertranslator.{dylib,so,dll}` at runtime, wrapping ANGLE's real `sh::*` API. This file never existed anywhere (not in gfxstream, not in vanilla ANGLE, not in this fork's history) — `CMakeLists.txt` literally says the caller is responsible for providing it, and no caller ever did. Built as a standalone `cc_shared_library` via Bazel (`//host/gl/glestranslator/gles_v2:shadertranslator`), copied next to `libgfxstream_backend` by a Meson `custom_target` gated on `decoders=gles`. | Session work. Initial version had a real bug (see 0008) found by the boot test that 0008 documents — kept as its own commit since it's the structural piece (the ABI shape, the Bazel/Meson wiring), not the bugfix. |
+| 0008 | `third_party/angle, host/gl: fix ANGLE_ENABLE_GLSL gap, null nameHashingMap crash` | Two real bugs found by an actual boot test with `use_gles(true)`: (a) the `translator` Bazel target never defined `ANGLE_ENABLE_GLSL` (ANGLE's `CodeGen.cpp::ConstructCompiler()` gates every output backend behind its own `#ifdef`, and GLSL's was never set — upstream gfxstream's Linux path only ever needs Vulkan/SPIRV output, so this was never exercised before), so `sh::ConstructCompiler()` unconditionally returned null for every `ST_GLSL_*_OUTPUT` gfxstream's macOS host path requests. Added the define plus the ~15 missing `glsl/*.cpp`/`tree_ops/glsl/*.cpp` (incl. `apple/` subdir) source files that backend actually needs. (b) `ShaderTranslator.cpp`'s failure fallback path left `nameHashingMap` null, but the caller dereferences it unconditionally — caused a real `SIGSEGV` during the same boot test, before (a) was fixed. | **This is the actual root-cause fix for the multi-session GLES shader-compile blocker.** Confirmed nothing to do with Apple's ANGLE-over-Metal runtime (disproven in an earlier session) or `#version` pragmas (0005's old hypothesis) — it was always a missing preprocessor define in our own Bazel glue. |
 **Validated**: `meson setup -Ddecoders=vulkan --buildtype=debug && ninja` clean after 0003; `meson setup
 -Ddecoders=vulkan,gles,composer --buildtype=debug && ninja` clean after 0004 and 0005, run directly inside
 the fork clone after each commit. 0006/0007: full `decoders=vulkan,gles,composer` meson+ninja build clean
-end to end, plus a standalone `dlopen`+`dlsym`+call test of the resulting `libshadertranslator.dylib`
-returning success. Not yet validated: an actual Android boot exercising the GLES/composer3 decoder.
+end to end, plus a standalone `dlopen`/`dlsym`/call test of the resulting `libshadertranslator.dylib`
+returning success. **0008: validated by a real boot** (`scripts/run-capy.sh` with `use_gles(true)`,
+temporarily) — `ConstructCompiler` now returns valid handles for both vertex and fragment stages of
+gfxstream's internal blit shader, and the renderer proceeds past shader compilation with no crash
+(previously: `SIGABRT` from a `GFXSTREAM_FATAL` "Could not compile shader" log, or `SIGSEGV` before that).
+Not yet validated: a real Android guest driving the full GLES/composer3 decoder end-to-end — only tested
+against a minimal `/bin/sh` root, which doesn't run a compositor.
 
 0001-0005 carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
-2 pre-existing ones, at the repo owner's explicit instruction. 0006/0007 don't have that trailer yet —
+2 pre-existing ones, at the repo owner's explicit instruction. 0006-0008 don't have that trailer yet —
 add it before pushing if the same convention should apply.
 
 ## kernel — GKI virtio-tpm (no fork branch — different ecosystem)
