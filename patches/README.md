@@ -47,6 +47,25 @@ the fork clone after each commit.
 All 5 commits carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
 2 pre-existing ones, at the repo owner's explicit instruction.
 
+## kernel — GKI virtio-tpm (no fork branch — different ecosystem)
+
+Unlike libkrun/gfxstream, the Android GKI kernel (`kernel/common`) isn't a single git repo we can
+fork — it's a multi-repo `repo`-tool manifest spanning dozens of AOSP projects. There's no
+"submodule" or "fork branch" equivalent here. Instead, see `patches/kernel/README.md` for:
+
+- `pinned-manifest.xml` — a revision-locked `repo manifest` snapshot (exact SHA per sub-project),
+  replacing a floating `-b common-android16-6.12` branch reference.
+- `0001-add-tpm-virtio-driver.patch` — a real unified diff (`git apply -p1`) for the
+  `tpm_virtio` driver wiring, replacing line-anchored `sed -i` edits.
+- `capivara_gki.config` — a Kconfig fragment merged via the kernel's own
+  `scripts/kconfig/merge_config.sh`, replacing more `sed -i` deletions/insertions on
+  `gki_defconfig`.
+
+This was a direct response to discovering the old `sed`-based approach had already silently
+stopped doing some of what it was meant to do (see `patches/kernel/README.md` for specifics) —
+the floating branch had drifted enough that several of the script's `sed` deletions were already
+no-ops against current upstream.
+
 ## Recommended next steps
 
 1. Push `capivara/macos-gfxstream-vulkan` (libkrun) and `capivara/macos-gfxstream-build` (gfxstream) to
