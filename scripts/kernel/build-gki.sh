@@ -1,33 +1,42 @@
 #!/bin/bash
-# scripts/kernel/build-gki-android16-virtio-mmio-tpm.sh — reproduz o build do GKI usado pelo Capivara
+# scripts/kernel/build-gki.sh — reproduz o build do GKI usado pelo Capivara (virtio-tpm)
 #
-# Pipeline, em ordem: repo sync (revisão pinada) → aplica patch do driver virtio-tpm → merge do
-# fragmento de Kconfig → build via Bazel/Kleaf → coleta e verifica os artefatos.
+# Pipeline, em ordem: repo sync (revisão pinada da versão escolhida) → aplica patch do driver
+# virtio-tpm → merge do fragmento de Kconfig → build via Bazel/Kleaf → coleta e verifica os
+# artefatos.
 #
-# Tudo que define O QUE muda (manifest pinado, patch, fragmento de config) vive em
-# patches/kernel/ — este script só orquestra; nenhuma lógica de patch/config aqui além da
-# aplicação. Ver patches/kernel/README.md para o que cada arquivo faz e como atualizar o pin.
+# Tudo que define O QUE muda (manifest pinado, patch) vive em patches/kernel/<versão>/; o
+# fragmento de Kconfig é compartilhado entre versões em patches/kernel/capivara_gki.config — este
+# script só orquestra. Ver patches/kernel/README.md.
 #
-# Substituiu um esquema antigo de 3 scripts separados (patch-gki-android16.sh,
-# collect-gki-artifacts.sh) cada um chamado só por este, mais `sed -i` em linhas-âncora pra editar
-# o defconfig — frágil contra drift do AOSP upstream (ver git log deste arquivo / patches/kernel/README.md
-# pra detalhes do que já tinha virado no-op silencioso). Consolidado num script só porque nenhuma
-# das partes era reusada independentemente.
+# Uso: build-gki.sh <android-version> [artifacts-dir] [kernel-dir] [kernel-dist-dir]
+#   android-version: android14 | android15 | android16 (default: android16)
+#
+# Trocar de versão é só apontar pra outra pasta em patches/kernel/ — ver
+# "Como adicionar uma nova versão" em patches/kernel/README.md para o processo de pinar e gerar o
+# patch contra um branch GKI diferente (common-android<N>-<kernel-version>).
 
 set -euo pipefail
 
-ARTIFACTS_DIR="${1:-/tmp/artifacts}"
-KERNEL_DIR="${2:-/tmp/kernel}"
-KERNEL_DIST_DIR="${3:-/tmp/kernel-dist}"
+ANDROID_VERSION="${1:-android16}"
+ARTIFACTS_DIR="${2:-/tmp/artifacts}"
+KERNEL_DIR="${3:-/tmp/kernel}"
+KERNEL_DIST_DIR="${4:-/tmp/kernel-dist}"
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PATCHES_DIR="$REPO_ROOT/patches/kernel"
-PINNED_MANIFEST="$PATCHES_DIR/pinned-manifest.xml"
-PATCH="$PATCHES_DIR/0001-add-tpm-virtio-driver.patch"
+VERSION_DIR="$PATCHES_DIR/$ANDROID_VERSION"
+PINNED_MANIFEST="$VERSION_DIR/pinned-manifest.xml"
+PATCH="$VERSION_DIR/0001-add-tpm-virtio-driver.patch"
 CONFIG_FRAGMENT="$PATCHES_DIR/capivara_gki.config"
 
 if ! command -v repo >/dev/null 2>&1; then
   echo "✗ repo não encontrado" >&2
+  exit 1
+fi
+if [ ! -d "$VERSION_DIR" ]; then
+  echo "✗ versão desconhecida: $ANDROID_VERSION (não existe $VERSION_DIR)." >&2
+  echo "  Versões disponíveis: $(ls -d "$PATCHES_DIR"/android* 2>/dev/null | xargs -n1 basename | tr '\n' ' ')" >&2
   exit 1
 fi
 for f in "$PINNED_MANIFEST" "$PATCH" "$CONFIG_FRAGMENT"; do
@@ -36,6 +45,8 @@ for f in "$PINNED_MANIFEST" "$PATCH" "$CONFIG_FRAGMENT"; do
     exit 1
   fi
 done
+
+echo "→ versão: $ANDROID_VERSION ($VERSION_DIR)"
 
 # ── 1. repo sync na revisão pinada ──────────────────────────────────────────────────────────────
 mkdir -p "$KERNEL_DIR"
@@ -61,8 +72,8 @@ elif git apply --reverse --check -p1 "$PATCH" 2>/dev/null; then
   echo "✓ Patch já estava aplicado: $(basename "$PATCH")"
 else
   echo "✗ Patch não aplica nem está aplicado — árvore divergiu da revisão pinada em" \
-       "patches/kernel/pinned-manifest.xml. Não vou tentar adivinhar; atualize o pin ou" \
-       "regenere o patch (ver patches/kernel/README.md)." >&2
+       "patches/kernel/$ANDROID_VERSION/pinned-manifest.xml. Não vou tentar adivinhar; atualize o" \
+       "pin ou regenere o patch (ver patches/kernel/README.md)." >&2
   exit 1
 fi
 
@@ -104,4 +115,4 @@ if ! find "$ARTIFACTS_DIR" -name "tpm_virtio.ko" | grep -q .; then
   exit 1
 fi
 
-echo "✓ GKI build completo em $ARTIFACTS_DIR"
+echo "✓ GKI build completo ($ANDROID_VERSION) em $ARTIFACTS_DIR"

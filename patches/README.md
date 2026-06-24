@@ -53,13 +53,18 @@ Unlike libkrun/gfxstream, the Android GKI kernel (`kernel/common`) isn't a singl
 fork — it's a multi-repo `repo`-tool manifest spanning dozens of AOSP projects. There's no
 "submodule" or "fork branch" equivalent here. Instead, see `patches/kernel/README.md` for:
 
-- `pinned-manifest.xml` — a revision-locked `repo manifest` snapshot (exact SHA per sub-project),
-  replacing a floating `-b common-android16-6.12` branch reference.
-- `0001-add-tpm-virtio-driver.patch` — a real unified diff (`git apply -p1`) for the
-  `tpm_virtio` driver wiring, replacing line-anchored `sed -i` edits.
-- `capivara_gki.config` — a Kconfig fragment merged via the kernel's own
+- One subdirectory per Android version (`android16/`, with `android14/`/`android15/` to follow —
+  see "Como adicionar uma nova versão" in that README), each with:
+  - `pinned-manifest.xml` — a revision-locked `repo manifest` snapshot (exact SHA per
+    sub-project), replacing a floating `-b common-android<N>-<kv>` branch reference.
+  - `0001-add-tpm-virtio-driver.patch` — a real unified diff (`git apply -p1`) for the
+    `tpm_virtio` driver wiring, replacing line-anchored `sed -i` edits.
+- `capivara_gki.config` — a Kconfig fragment (shared across versions), merged via the kernel's own
   `scripts/kconfig/merge_config.sh`, replacing more `sed -i` deletions/insertions on
   `gki_defconfig`.
+- One orchestrating script, `scripts/kernel/build-gki.sh <android-version>` — selects the version
+  subdirectory and runs the whole pipeline. Replaced 3 separate scripts across 3 directories that
+  existed for one linear, never-independently-reused pipeline.
 
 This was a direct response to discovering the old `sed`-based approach had already silently
 stopped doing some of what it was meant to do (see `patches/kernel/README.md` for specifics) —

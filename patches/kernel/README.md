@@ -5,14 +5,27 @@ um conjunto de edições imperativas (`sed -i`/`grep`/`echo`) direto numa árvor
 em toda execução, hoje é um patch real + um fragmento de Kconfig, aplicados contra uma revisão
 explicitamente pinada — não uma branch flutuante.
 
-Tudo que define O QUE muda no kernel vive aqui, em `patches/kernel/`: o manifest pinado, o patch e
-o fragmento de config. O único executável é `scripts/kernel/build-gki-android16-virtio-mmio-tpm.sh`
-— um script só, que orquestra repo sync → aplica patch → merge config → build Bazel → coleta
-artefatos. Antes disso existiam **3 diretórios** (`kernel/`, `scripts/kernel/`, `patches/kernel/`)
-e **3 scripts separados** pra uma única pipeline linear, mais o código-fonte do driver duplicado
-(solto em `kernel/drivers/char/tpm/tpm_virtio.c` *e* embutido no patch) — consolidado nesta pasta
-porque nenhuma das peças era reusada independentemente. O patch (`0001-*.patch`) agora é a única
-fonte de verdade do driver; não existe mais um `.c` solto no monorepo.
+Tudo que define O QUE muda no kernel vive aqui, em `patches/kernel/`: o manifest pinado e o patch
+do driver, um por versão de Android (`android14/`, `android15/`, `android16/`), mais o fragmento
+de config (compartilhado, já que são só símbolos Kconfig — não muda por versão a menos que o
+upstream renomeie algum símbolo). O único executável é `scripts/kernel/build-gki.sh` — um script
+só, parametrizado pela versão, que orquestra repo sync → aplica patch → merge config → build
+Bazel → coleta artefatos. Antes disso existiam **3 diretórios** (`kernel/`, `scripts/kernel/`,
+`patches/kernel/`) e **3 scripts separados** pra uma única pipeline linear, mais o código-fonte do
+driver duplicado (solto em `kernel/drivers/char/tpm/tpm_virtio.c` *e* embutido no patch) —
+consolidado porque nenhuma das peças era reusada independentemente. O patch de cada versão é a
+única fonte de verdade do driver para aquela versão; não existe mais um `.c` solto no monorepo.
+
+```
+patches/kernel/
+  capivara_gki.config           # compartilhado entre versões
+  README.md
+  android16/
+    pinned-manifest.xml         # SHA exato de common-android16-6.12 + sub-projetos
+    0001-add-tpm-virtio-driver.patch
+  android15/                    # mesma estrutura, ainda não gerado — ver abaixo
+  android14/                    # idem
+```
 
 ## O que motivou essa migração
 
@@ -34,8 +47,8 @@ Confirmado durante a implementação (não especulativo):
 
 - **`pinned-manifest.xml`** — manifest "revision-locked" (`repo manifest -r`), com o SHA exato de
   cada sub-projeto do AOSP usado neste build (`kernel/common`, toolchains, etc.), em vez de
-  `-b common-android16-6.12` solto. Consumido via
-  `repo init -u file://.../patches/kernel/pinned-manifest.xml --standalone-manifest`.
+  `-b common-android16-6.12` solto (mesmo padrão pra android14/15, branches diferentes). Consumido via
+  `repo init -u file://.../patches/kernel/<versão>/pinned-manifest.xml --standalone-manifest`.
   - **Ajuste necessário**: o manifest gerado pelo `repo manifest -r` vem com
     `<remote fetch="..">`, resolvido relativo à URL do *manifest git repo* original
     (`https://android.googlesource.com/kernel/manifest`). Isso quebra com `--standalone-manifest`
@@ -45,13 +58,14 @@ Confirmado durante a implementação (não especulativo):
     `kernel/common` relativo ao caminho do próprio arquivo de manifest e falha com "does not appear
     to be a git repository". Validado com um `repo init`+`repo sync common` limpo a partir do
     arquivo final.
-  - **Como atualizar o pin deliberadamente**: clonar `common-android16-6.12` normalmente
+  - **Como atualizar o pin de uma versão existente**: clonar a branch dessa versão normalmente
     (`repo init -u https://android.googlesource.com/kernel/manifest -b common-android16-6.12 &&
     repo sync`), gerar um novo `repo manifest -r -o pinned-manifest.xml`, aplicar o mesmo ajuste de
-    `fetch=".."` → URL absoluta, e então regenerar `0001-add-tpm-virtio-driver.patch` (abaixo) caso
-    o patch não aplique mais limpo contra a nova revisão.
-- **`0001-add-tpm-virtio-driver.patch`** — patch unificado (`git apply -p1`, com `-p1` porque o
-  diff foi gerado de dentro de `common/`) cobrindo:
+    `fetch=".."` → URL absoluta, sobrescrever `patches/kernel/android16/pinned-manifest.xml`, e
+    então regenerar `0001-add-tpm-virtio-driver.patch` (abaixo) caso o patch não aplique mais
+    limpo contra a nova revisão.
+- **`<versão>/0001-add-tpm-virtio-driver.patch`** — patch unificado (`git apply -p1`, com `-p1`
+  porque o diff foi gerado de dentro de `common/`) cobrindo:
   - `drivers/char/tpm/tpm_virtio.c` (arquivo novo — este patch é a única fonte de verdade do
     driver no monorepo; pra ler/editar o código, aplique o patch numa árvore ou abra o `.patch`
     direto, já que é um diff de "arquivo novo" — todo o conteúdo aparece prefixado com `+`,
@@ -77,16 +91,16 @@ Confirmado durante a implementação (não especulativo):
     o CI real (`ubuntu-latest`, GNU coreutils nativo), mas testar localmente num Mac requer
     `brew install coreutils gnu-sed` e prefixar o `PATH` com `gnubin` antes de chamar o script.
 
-## Validado
+## Validado (android16)
 
-- `git apply --check -p1 patches/kernel/0001-add-tpm-virtio-driver.patch` limpo contra
+- `git apply --check -p1 patches/kernel/android16/0001-add-tpm-virtio-driver.patch` limpo contra
   `kernel/common` na revisão pinada (clone fresco, sem cache).
 - `tpm_virtio.c` pós-patch é byte-idêntico ao que existia em `kernel/drivers/char/tpm/tpm_virtio.c`
   antes da consolidação (arquivo removido — o patch é a fonte de verdade agora).
 - `merge_config.sh -m` produz um `gki_defconfig` com as 6 flags presentes e em efeito (a única
   diferença vs. o `sed` antigo é a *posição* de `CONFIG_UDMABUF=y` no arquivo — já estava `y` por
   padrão upstream, o merge só moveu a linha para o bloco anexado; sem diferença de comportamento).
-- `repo init -u file://.../pinned-manifest.xml --standalone-manifest` sozinho: roda e identifica
+- `repo init -u file://.../android16/pinned-manifest.xml --standalone-manifest` sozinho: roda e identifica
   corretamente a URL de fetch absoluta (`https://android.googlesource.com/kernel/common`),
   confirmado via `ps aux` durante a execução. **Não confirmado**: o `repo sync` subsequente até o
   fim — na prática, isso dispara um clone real de `kernel/common` (~1.6GB) pela rede, sem
@@ -123,6 +137,35 @@ sem cache, rodado uma vez). O que **não** foi confirmado:
 - O build completo via Bazel (`./tools/bazel run //common:kernel_aarch64_dist`) com a árvore
   pinada + patchada não foi rodado até o fim aqui (validei só a preparação da árvore: patch +
   config + manifest; o build em si já funcionava antes e não foi alterado por esta migração).
+
+## Como adicionar uma nova versão (android14, android15, ...)
+
+`android15/` e `android14/` ainda não existem — só `android16/` foi gerado e validado nesta
+passada. Pra adicionar uma versão nova:
+
+1. Confirme o nome exato do branch GKI dessa versão (convenção AOSP:
+   `common-android<N>-<kernel-version>`, ex. `common-android15-6.6`, `common-android14-6.1` — não
+   assuma, confira em `https://android.googlesource.com/kernel/common/+refs` antes de pinar
+   qualquer coisa).
+2. `repo init -u https://android.googlesource.com/kernel/manifest -b common-android<N>-<kv> &&
+   repo sync` num diretório temporário (clone real, leva tempo de rede — ver "Não validado ainda"
+   abaixo pra escala esperada).
+3. `repo manifest -r -o pinned-manifest.xml`, depois corrigir `fetch=".."` para
+   `fetch="https://android.googlesource.com/"` (URL absoluta — ver nota acima, mesmo bug se
+   reaplica em qualquer versão).
+4. Aplicar manualmente as mesmas 4 edições do patch atual (`tpm_virtio.c` novo,
+   stanza `Kconfig`, regra `Makefile`, `#define VIRTIO_ID_TPM` em `virtio_ids.h`, remoção de
+   `bootconfig` do `CONFIG_CMDLINE`) na árvore clonada — os arquivos-alvo provavelmente têm
+   conteúdo diferente ao redor do ponto de inserção entre versões de kernel, por isso não dá pra
+   simplesmente copiar o patch do `android16/` e esperar que aplique limpo. Capturar com
+   `git diff` (mesmo processo usado pra gerar `android16/0001-add-tpm-virtio-driver.patch`).
+5. Criar `patches/kernel/android<N>/` com o `pinned-manifest.xml` e o `.patch` gerados; o
+   `capivara_gki.config` é reusado como está, a menos que algum dos 6 símbolos Kconfig tenha sido
+   renomeado/removido nessa versão (checar `Kconfig` correspondente antes de assumir).
+6. Adicionar a opção no `workflow_dispatch.inputs.android_version` em
+   `.github/workflows/build-gki.yml` (já é uma lista, só adicionar o item).
+7. Testar com `./scripts/kernel/build-gki.sh android<N>` localmente (ou via `workflow_dispatch`
+   no CI) antes de considerar a versão pronta.
 
 ## Fora de escopo
 

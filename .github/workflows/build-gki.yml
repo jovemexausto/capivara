@@ -1,17 +1,26 @@
-name: build-gki-android16-virtio-mmio-tpm
+name: build-gki
 
 on:
   workflow_dispatch:
+    inputs:
+      android_version:
+        description: "Versão do branch GKI (patches/kernel/<versão>/)"
+        type: choice
+        options:
+          - android16
+          - android15
+          - android14
+        default: android16
 
 jobs:
   build-gki:
     runs-on: ubuntu-latest
     timeout-minutes: 180
-    
+
     steps:
       - name: Checkout capivara
         uses: actions/checkout@v4
-        
+
       - name: Free up disk space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache
@@ -19,14 +28,14 @@ jobs:
           sudo docker rmi $(docker images -q) 2>/dev/null || true
           sudo apt-get clean
           df -h
-        
+
       - name: Add extra swap
         run: |
           sudo dd if=/dev/zero of=/mnt/extra-swapfile bs=1M count=8192
           sudo chmod 600 /mnt/extra-swapfile
           sudo mkswap /mnt/extra-swapfile
           sudo swapon /mnt/extra-swapfile
-          
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -37,8 +46,9 @@ jobs:
           git config --global user.name "Capivara CI"
 
       # /tmp/kernel é o checkout `repo sync` da árvore AOSP pinada em
-      # patches/kernel/pinned-manifest.xml. Esse manifest fixa um SHA exato por projeto, então o
-      # conteúdo do checkout só muda quando o arquivo de manifest muda — cachear por hash dele evita
+      # patches/kernel/<android_version>/pinned-manifest.xml. Esse manifest fixa um SHA exato por
+      # projeto, então o conteúdo do checkout só muda quando o arquivo de manifest muda — cachear
+      # por hash dele (já namespaced por versão, já que cada versão tem seu próprio arquivo) evita
       # reclonar vários GB via `repo sync` em toda execução manual deste workflow.
       # Nota: o checkout completo (com toolchains prebuilt) passou de 10GB localmente, perto do
       # limite de 10GB por repositório do actions/cache — se o cache não for salvo (silenciosamente
@@ -48,15 +58,15 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /tmp/kernel
-          key: gki-repo-sync-${{ hashFiles('patches/kernel/pinned-manifest.xml') }}
+          key: gki-repo-sync-${{ inputs.android_version }}-${{ hashFiles(format('patches/kernel/{0}/pinned-manifest.xml', inputs.android_version)) }}
 
       - name: Build kernel (aarch64)
         run: |
-          "$GITHUB_WORKSPACE/scripts/kernel/build-gki-android16-virtio-mmio-tpm.sh" /tmp/artifacts /tmp/kernel /tmp/kernel-dist
+          "$GITHUB_WORKSPACE/scripts/kernel/build-gki.sh" "${{ inputs.android_version }}" /tmp/artifacts /tmp/kernel /tmp/kernel-dist
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: gki-android16-virtio-mmio-tpm-${{ github.run_id }}
+          name: gki-${{ inputs.android_version }}-virtio-mmio-tpm-${{ github.run_id }}
           path: /tmp/artifacts/
           retention-days: 30
