@@ -19,7 +19,7 @@ validado). O caminho GLES pro composer3 tinha dois bloqueios reais — `USE_ANGL
 nunca portado do `CMakeLists.txt` pro `meson.build`, e o shim C-ABI que `angle_shader_parser.cpp`
 espera via `dlopen` (`libshadertranslator.dylib`) nunca implementado em lugar nenhum (nem no
 gfxstream, nem na ANGLE, nem no histórico do fork) — ambos resolvidos: a ANGLE é vendorizada via
-Bazel `git_repository()` pinada (sem fork pessoal, sem mudanças originais na ANGLE), e o shim
+Bazel `git_repository()` pinada, e o shim
 (`ShaderTranslator.h`/`.cpp`, ver `vendor/gfxstream/host/gl/glestranslator/gles_v2/`) embrulha a API
 real da ANGLE (`sh::*`) num ABI plano. O build completo (`decoders=vulkan,gles,composer`) compila
 limpo ponta a ponta e o shim carrega/roda via `dlopen` de verdade — mas **ainda não validado por
