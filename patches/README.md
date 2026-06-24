@@ -27,7 +27,7 @@ been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the f
 anywhere in the tree is `krun-init-blob`'s build script (musl cross-link, macOS host linker) — confirmed
 pre-existing on fork `main` with zero patches applied.
 
-## gfxstream — `capivara/macos-gfxstream-build` (5 commits)
+## gfxstream — `capivara/macos-gfxstream-build` (7 commits)
 
 Built from fork `main`, starting with the 2 commits that were the old, narrower `capivara/macos-shm-fix`
 PR branch (kept — they're real and unrelated to the rest), then 3 new commits hand-extracted this pass:
@@ -38,14 +38,19 @@ PR branch (kept — they're real and unrelated to the rest), then 3 new commits 
 | 0002 | `host: propagate createBlob failures` | `stream_renderer_create_blob` now returns the real error code instead of always `0`. | Pre-existing PR content, unchanged. |
 | 0003 | `host: add Metal-backed Vulkan-only build support for macOS` | New `native_sub_window_metal.mm` (CAMetalLayer-based native window, replacing the deprecated NSOpenGL/cocoa path), the darwin framework/link-args block in `meson.build`, `GFXSTREAM_ENABLE_HOST_GLES` guards in `frame_buffer.cpp`/`color_buffer.cpp`/`gles_compat.h`, plus stub backends (`iostream`, `snapshot`) for subsystems not needed on this platform. | **This is what first made gfxstream buildable for macOS/HVF at all** — predates the libkrun session work, was never extracted as its own commit before. Found by diffing the vendored tree (with the 2 patches below reverse-applied) against the old `macos-shm-fix` branch: `host/native_sub_window_metal.mm` plain doesn't exist anywhere in the fork's history before this. |
 | 0004 | `host: fix macOS build for decoders=vulkan,gles,composer` | 7 real bugs blocking the GLES/composer decoders on top of 0003's Vulkan-only base: missing brace, 3 duplicate function defs, missing `getConfigs` wrapper, missing `objcpp_args` (so `.mm` files never saw `GFXSTREAM_ENABLE_HOST_GLES`), conditional macOS frameworks for GLES. | Session work. |
-| 0005 | `host/gl/texture_draw: use GLSL ES 3.00 pragmas under the GLES decoder` | Adds GLSL ES 3.00 core-profile shader variants for the blit shaders. | Session work. **Does not make the GLES decoder fully work** — Apple's internal ANGLE-over-Metal shim still rejects the blit shader compile with an empty info log, independent of `#version` pragma. Root cause still open. The Vulkan-only path (0001-0003) is unaffected and is the validated, working configuration. |
+| 0005 | `host/gl/texture_draw: use GLSL ES 3.00 pragmas under the GLES decoder` | Adds GLSL ES 3.00 core-profile shader variants for the blit shaders. | Session work. Superseded as the "why GLES doesn't work" diagnosis by 0006/0007 below — the real blocker was never the `#version` pragma or ANGLE-over-Metal (that hypothesis was investigated and disproved with direct Metal/OpenGL.framework compile tests); it was `USE_ANGLE_SHADER_PARSER` never being wired into the Meson build, and the ANGLE shader translator never being vendored at all. See `capivara-gles-shader-translator-missing` memory for the full diagnosis trail. |
+| 0006 | `third_party/angle: fix macOS coverage gaps in Bazel build glue` | `angle_common`/`angle_glslang`'s `select()`s on `@platforms//os` only had linux/windows branches (one had no default, the other silently always picked the linux source unconditionally). Added macOS branches + `//conditions:default` fallbacks. | **Generic Bazel+macOS bug, not Capivara-specific — good upstream candidate.** Verified with a full `bazel clean --expunge` + rebuild of `@angle//:translator` using only this tracked `BUILD.angle.bazel`, no local ANGLE checkout needed (`git_repository()` fetches its own copy at the pinned commit `8b39631d6ab5a2efa21629c6fa94a80381720950`). |
+| 0007 | `host/gl: implement the missing angle_shader_translator C ABI` | New `ShaderTranslator.{h,cpp}` — the flat C ABI (`ST_*`) that `angle_shader_parser.cpp` `dlopen()`s as `libshadertranslator.{dylib,so,dll}` at runtime, wrapping ANGLE's real `sh::*` API. This file never existed anywhere (not in gfxstream, not in vanilla ANGLE, not in this fork's history) — `CMakeLists.txt` literally says the caller is responsible for providing it, and no caller ever did. Built as a standalone `cc_shared_library` via Bazel (`//host/gl/glestranslator/gles_v2:shadertranslator`), copied next to `libgfxstream_backend` by a Meson `custom_target` gated on `decoders=gles`. | Session work. **Capivara-authored, not yet boot-validated** — confirmed the full build links clean and a standalone `dlopen`/`dlsym`/call test of `STInitialize()` succeeds, but the actual shader compile/link path through a real Android boot is untested. Hold off upstreaming until that validation happens; the design (flat-POD ABI mirroring ANGLE's reflection types) is sound but the exact field set in `ST_ShaderVariable`/`ST_InterfaceBlock` was derived from gfxstream's own consumers (`program_data.cpp`), not from any reference implementation, so it may need a field or two more once exercised by real shaders. |
 
 **Validated**: `meson setup -Ddecoders=vulkan --buildtype=debug && ninja` clean after 0003; `meson setup
 -Ddecoders=vulkan,gles,composer --buildtype=debug && ninja` clean after 0004 and 0005, run directly inside
-the fork clone after each commit.
+the fork clone after each commit. 0006/0007: full `decoders=vulkan,gles,composer` meson+ninja build clean
+end to end, plus a standalone `dlopen`+`dlsym`+call test of the resulting `libshadertranslator.dylib`
+returning success. Not yet validated: an actual Android boot exercising the GLES/composer3 decoder.
 
-All 5 commits carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
-2 pre-existing ones, at the repo owner's explicit instruction.
+0001-0005 carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
+2 pre-existing ones, at the repo owner's explicit instruction. 0006/0007 don't have that trailer yet —
+add it before pushing if the same convention should apply.
 
 ## kernel — GKI virtio-tpm (no fork branch — different ecosystem)
 

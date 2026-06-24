@@ -15,15 +15,18 @@ Android rodando nativamente em Apple Silicon macOS via HVF, `libkrun` e `gfxstre
 ## Estado atual
 
 O build padrão deste repo está são e funcional (Vulkan-only via gfxstream/ASG, boot completo
-validado). O caminho GLES pro composer3 está bloqueado — causa raiz agora confirmada com dados
-reais, não é mais hipótese: `USE_ANGLE_SHADER_PARSER` nunca foi portado do `CMakeLists.txt` pro
-`meson.build` que de fato usamos, então toda tradução de shader GLES falha incondicionalmente
-(`ShaderParser::convertESSLToGLSL()` cai sempre no branch `#else m_valid = false`, sem log algum).
-E mesmo se a flag fosse ligada, a fonte da ANGLE não está vendorizada em `vendor/gfxstream/
-third_party/angle/` (só tem arquivos de build do Bazel, não o código). Não tem nada a ver com
-Metal/ANGLE-over-Metal/XPC — descartei essa hipótese com testes diretos (compilação Metal isolada
-funciona limpo; compilação via desktop OpenGL.framework do shader traduzido manualmente também
-funciona limpo). Ver memória `capivara-gles-shader-translator-missing` para o diagnóstico completo.
+validado). O caminho GLES pro composer3 tinha dois bloqueios reais — `USE_ANGLE_SHADER_PARSER`
+nunca portado do `CMakeLists.txt` pro `meson.build`, e o shim C-ABI que `angle_shader_parser.cpp`
+espera via `dlopen` (`libshadertranslator.dylib`) nunca implementado em lugar nenhum (nem no
+gfxstream, nem na ANGLE, nem no histórico do fork) — ambos resolvidos: a ANGLE é vendorizada via
+Bazel `git_repository()` pinada (sem fork pessoal, sem mudanças originais na ANGLE), e o shim
+(`ShaderTranslator.h`/`.cpp`, ver `vendor/gfxstream/host/gl/glestranslator/gles_v2/`) embrulha a API
+real da ANGLE (`sh::*`) num ABI plano. O build completo (`decoders=vulkan,gles,composer`) compila
+limpo ponta a ponta e o shim carrega/roda via `dlopen` de verdade — mas **ainda não validado por
+boot real** exercitando o decoder GLES. Não tem nada a ver com Metal/ANGLE-over-Metal/XPC —
+hipótese descartada com testes diretos numa sessão anterior. Ver memória
+`capivara-gles-shader-translator-missing` e `patches/README.md` (gfxstream 0006/0007) para o
+diagnóstico completo e o que é upstreamável.
 
-Resolver isso de verdade é vendorizar a ANGLE real + portar o wiring de build pro Meson — um
-projeto de infraestrutura separado, não um patch de shader pontual.
+Próximo passo: `use_gles(true)` em `vendor/libkrun/.../virtio_gpu.rs` + boot real pra validar o
+decoder GLES/composer3 ponta a ponta.
