@@ -646,7 +646,7 @@ fn build_boot_contract(args: &Args) -> anyhow::Result<BootContract> {
         for hint in [
             format!("androidboot.hardware={}", soc.hardware),
             "androidboot.hardware.egl=emulation".to_string(),
-            "androidboot.hardware.gralloc=default".to_string(),
+            "androidboot.hardware.gralloc=minigbm".to_string(),
             "androidboot.hardware.hwcomposer=ranchu".to_string(),
             "androidboot.hardware.vulkan=ranchu".to_string(),
             "androidboot.hardware.gltransport=virtio-gpu-pipe".to_string(),

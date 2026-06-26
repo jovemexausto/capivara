@@ -10,7 +10,7 @@ numbered `git format-patch` series — so nothing depends on the `/tmp` clone su
 apply cleanly with `git am patches/<repo>/*.patch` against the respective fork's `main`, and both have
 been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the fork clones.
 
-## libkrun — `capivara/macos-gfxstream-vulkan` (8 commits)
+## libkrun — `capivara/macos-gfxstream-vulkan` (9 commits)
 
 | # | Commit | What | Why it's there |
 |---|---|---|---|
@@ -22,13 +22,14 @@ been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the f
 | 0006 | `virtio/gpu: wire the real map_sender into new_gfxstream on macOS` | Connects the real `map_sender` channel into `new_gfxstream` instead of the scaffolding's placeholder. | |
 | 0007 | `virtio/gpu: defer gfxstream TransferFromHost3d to break dispatcher deadlock` | One-shot helper thread defers blocking `TransferFromHost3d` reads off the single in-order dispatcher thread. | Fixes the dispatcher deadlock that blocked full Android boot. |
 | 0008 | `virtio/gpu: document that the GLES shader-compile blocker is now fixed` | Comment-only update in `create_rutabaga_gfxstream`'s `use_gles(false)` rationale, pointing at the real fix (gfxstream 0006-0008) instead of the disproven ANGLE-over-Metal hypothesis. `use_gles` still defaults to `false` pending a real Android-guest boot test (only tested against a minimal `/bin/sh` root so far, via a temporary diagnostic edit, reverted). | Keeps the comment from misleading whoever reads it next. |
+| 0009 | `virtio/gpu: flip use_gles(true) to the validated default` | Flips `set_use_gles(false)` to `true`, rewrites the rationale comment. | A real Android guest boot (composer3/RanchuHwc + SurfaceFlinger, plus `crates/capy`'s `gralloc=minigbm`) confirmed `render_control.cpp`/`renderControl_dec` only compile into `libgfxstream_backend` when `use_gles` is on — a Vulkan-only build leaves RanchuHwc's legacy `pipe:opengles` host-extension query unanswered forever, hanging composer until the Watchdog kills `system_server`. SurfaceFlinger ran stable for 800s+ with this on. |
 
 **Validated**: `cargo check` clean for `libkrun`, `krun-vmm`, `krun-arch`, `krun-kernel`, `krun-smbios`,
 `krun-devices --features gpu-gfxstream`, and `krun-rutabaga-gfx --features gfxstream`. The only failure
 anywhere in the tree is `krun-init-blob`'s build script (musl cross-link, macOS host linker) — confirmed
 pre-existing on fork `main` with zero patches applied.
 
-## gfxstream — `capivara/macos-gfxstream-build` (8 commits)
+## gfxstream — `capivara/macos-gfxstream-build` (9 commits)
 
 Built from fork `main`, starting with the 2 commits that were the old, narrower `capivara/macos-shm-fix`
 PR branch (kept — they're real and unrelated to the rest), then 3 new commits hand-extracted this pass:
@@ -43,6 +44,7 @@ PR branch (kept — they're real and unrelated to the rest), then 3 new commits 
 | 0006 | `third_party/angle: fix macOS coverage gaps in Bazel build glue` | `angle_common`/`angle_glslang`'s `select()`s on `@platforms//os` only had linux/windows branches (one had no default, the other silently always picked the linux source unconditionally). Added macOS branches + `//conditions:default` fallbacks. | **Generic Bazel+macOS bug, not Capivara-specific — good upstream candidate.** Verified with a full `bazel clean --expunge` + rebuild of `@angle//:translator` using only this tracked `BUILD.angle.bazel`, no local ANGLE checkout needed (`git_repository()` fetches its own copy at the pinned commit `8b39631d6ab5a2efa21629c6fa94a80381720950`). |
 | 0007 | `host/gl: implement the missing angle_shader_translator C ABI` | New `ShaderTranslator.{h,cpp}` — the flat C ABI (`ST_*`) that `angle_shader_parser.cpp` `dlopen()`s as `libshadertranslator.{dylib,so,dll}` at runtime, wrapping ANGLE's real `sh::*` API. This file never existed anywhere (not in gfxstream, not in vanilla ANGLE, not in this fork's history) — `CMakeLists.txt` literally says the caller is responsible for providing it, and no caller ever did. Built as a standalone `cc_shared_library` via Bazel (`//host/gl/glestranslator/gles_v2:shadertranslator`), copied next to `libgfxstream_backend` by a Meson `custom_target` gated on `decoders=gles`. | Session work. Initial version had a real bug (see 0008) found by the boot test that 0008 documents — kept as its own commit since it's the structural piece (the ABI shape, the Bazel/Meson wiring), not the bugfix. |
 | 0008 | `third_party/angle, host/gl: fix ANGLE_ENABLE_GLSL gap, null nameHashingMap crash` | Two real bugs found by an actual boot test with `use_gles(true)`: (a) the `translator` Bazel target never defined `ANGLE_ENABLE_GLSL` (ANGLE's `CodeGen.cpp::ConstructCompiler()` gates every output backend behind its own `#ifdef`, and GLSL's was never set — upstream gfxstream's Linux path only ever needs Vulkan/SPIRV output, so this was never exercised before), so `sh::ConstructCompiler()` unconditionally returned null for every `ST_GLSL_*_OUTPUT` gfxstream's macOS host path requests. Added the define plus the ~15 missing `glsl/*.cpp`/`tree_ops/glsl/*.cpp` (incl. `apple/` subdir) source files that backend actually needs. (b) `ShaderTranslator.cpp`'s failure fallback path left `nameHashingMap` null, but the caller dereferences it unconditionally — caused a real `SIGSEGV` during the same boot test, before (a) was fixed. | **This is the actual root-cause fix for the multi-session GLES shader-compile blocker.** Confirmed nothing to do with Apple's ANGLE-over-Metal runtime (disproven in an earlier session) or `#version` pragmas (0005's old hypothesis) — it was always a missing preprocessor define in our own Bazel glue. |
+| 0009 | `host: close the ASG host/guest lost-wakeup race in RingStream::readRaw` | After publishing `ASG_HOST_STATE_NEED_NOTIFY`, issues a `StoreLoad` barrier and re-checks both rings before blocking on `onUnavailableRead()`. | Real race: the guest only pings when it observes `host_state == NEED_NOTIFY`; if it wrote a request and sampled `host_state` while still `CAN_CONSUME` (just before this store), it never pings, and the host's blocking receive sleeps forever on data already in the ring. Caused intermittent ~16s stalls on SurfaceFlinger/HWC's first host round-trip, tripping the Watchdog. Also ignores meson `*.stamp` build artifacts. |
 **Validated**: `meson setup -Ddecoders=vulkan --buildtype=debug && ninja` clean after 0003; `meson setup
 -Ddecoders=vulkan,gles,composer --buildtype=debug && ninja` clean after 0004 and 0005, run directly inside
 the fork clone after each commit. 0006/0007: full `decoders=vulkan,gles,composer` meson+ninja build clean
@@ -51,8 +53,9 @@ returning success. **0008: validated by a real boot** (`scripts/run-capy.sh` wit
 temporarily) — `ConstructCompiler` now returns valid handles for both vertex and fragment stages of
 gfxstream's internal blit shader, and the renderer proceeds past shader compilation with no crash
 (previously: `SIGABRT` from a `GFXSTREAM_FATAL` "Could not compile shader" log, or `SIGSEGV` before that).
-Not yet validated: a real Android guest driving the full GLES/composer3 decoder end-to-end — only tested
-against a minimal `/bin/sh` root, which doesn't run a compositor.
+**0009: validated by a real boot** — `SurfaceFlinger` stable for 800s+ continuous boot (combined
+with libkrun 0009 and `crates/capy`'s `gralloc=minigbm`), zero crashes, where the unfixed race
+previously caused intermittent ~16s stalls.
 
 0001-0005 carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
 2 pre-existing ones, at the repo owner's explicit instruction. 0006-0008 don't have that trailer yet —
@@ -106,5 +109,9 @@ Real, load-bearing code, not yet ported anywhere, no patch series exists for any
   (confirmed on `examples/boot_efi.c`: upstream renamed/added `krun_init_log`,
   `krun_add_virtio_console_default`, `krun_add_disk` since our vendoring point), not our contributions.
   Don't try to "fix" these as if they were ours.
-- `crates/capy/src/main.rs` (`androidboot.vsock_lights_port=6800`, MMIO transport cmdline, etc.) is
-  Capivara-specific glue, doesn't belong in either fork.
+- `crates/capy/src/main.rs` (`androidboot.vsock_lights_port=6800`, `androidboot.hardware.gralloc=
+  minigbm`, MMIO transport cmdline, etc.) is Capivara-specific glue, doesn't belong in either fork.
+- `tools/oemlock-stub/` — same category, one level further: not even cmdline glue, but a whole
+  binary Capivara has to ship because we don't run a Cuttlefish host companion (`cvd`). Validated
+  workaround for the `OemLockService` boot blocker (see its own README), not yet wired into any
+  boot path automatically.
