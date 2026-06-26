@@ -38,12 +38,33 @@ respondida, travando o composer até o `Watchdog` matar o `system_server`. Combi
 SurfaceFlinger importa um `AHardwareBuffer`), `SurfaceFlinger` ficou estável por 800s+ de boot
 contínuo, zero crashes.
 
-**Bloqueadores remanescentes até `sys.boot_completed=1`** (depois do composer estável):
+**Bloqueadores remanescentes até `sys.boot_completed=1`** (depois do composer estável), na ordem em
+que aparecem durante o boot — cada um só fica visível depois que o anterior é contornado:
 
 1. `OemLockService.<init>()` bloqueia 65s na main thread do `system_server` esperando
    `android.hardware.oemlock.IOemLock/default` no `servicemanager` — o HAL real do Cuttlefish
    precisa de um companion host via `/dev/hvc10` que não existe no Capivara. **Workaround
    validado, não integrado ao boot ainda**: ver `tools/oemlock-stub/README.md`.
-2. Com (1) contornado, o próximo bloqueador exposto: `PersistentDataBlockService` falha fatal na
-   boot phase 500 (`Service PersistentDataBlockService init timeout`) por falta da partição `frp`
-   no `androidboot.partition_map`. Ainda não investigado a fundo.
+2. `PersistentDataBlockService` falha fatal na boot phase 500 (`Service PersistentDataBlockService
+   init timeout`) por falta da partição `frp` (`androidboot.partition_map`/`androidboot.boot_devices`
+   não tinham suporte a esse papel — adicionado em `crates/capy/src/soc.rs`, `DiskRole::Frp`, via
+   `--disk frp=<img>`). Mesmo com a partição existindo, o device node `/dev/block/vdN` correspondente
+   sobe como disco "removível" pro `vold` (`delaying scan due to secure keyguard`) em vez de seguir o
+   caminho de first-stage init dos demais slots fixos — symlink `by-name/frp` e permissão
+   `root:system 0660` **não são criados automaticamente ainda**; workaround validado via `adb shell`
+   (`ln -s`/`chown`/`chmod`), não integrado ao boot.
+3. Com (1) e (2) contornados: bug real no host-side fence handling do gfxstream
+   (`asyncWaitForGpuWithCb`, patches/README.md gfxstream 0010) — mesma família da race do ASG
+   (0009), mas no caminho de `compose()` via pipe/render-control em vez do ring ASG/Vulkan. Um
+   `EmulatedEglFenceSync` com `destroyWhenSignaled=true` pode se autodestruir e sumir do registry
+   antes do comando virtio-gpu `GFXSTREAM_CREATE_EXPORT_SYNC` (canal separado, sem garantia de
+   ordem) tentar localizá-lo — o código antigo logava o erro e **dropava o callback de conclusão em
+   silêncio**, travando pra sempre o `dma_fence_default_wait` do `RanchuHwc` (e por consequência o
+   `presentDisplay`/`SurfaceFlinger`/`DisplayManagerService`). **Corrigido e commitado**: tratar
+   "não encontrado" como "já sinalizado" em vez de dropar o callback.
+4. Com (1)-(3) corrigidos: `SurfaceFlinger` chega a compor frames de verdade, mas ainda existe
+   instabilidade recorrente no ciclo de composite — `DisplayManagerService.<init>()` já foi
+   observado travando 65s numa chamada nativa *diferente* (`getCompositionColorSpaces` →
+   `nativeGetCompositionDataspaces`) que também faz round-trip síncrono pro `SurfaceFlinger`. Pode
+   ser uma variante intermitente da mesma família de race do (3), ou um bug distinto no mesmo
+   caminho. **Não investigado a fundo ainda** — próximo passo.

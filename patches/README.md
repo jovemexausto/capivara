@@ -29,7 +29,7 @@ been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the f
 anywhere in the tree is `krun-init-blob`'s build script (musl cross-link, macOS host linker) — confirmed
 pre-existing on fork `main` with zero patches applied.
 
-## gfxstream — `capivara/macos-gfxstream-build` (9 commits)
+## gfxstream — `capivara/macos-gfxstream-build` (10 commits)
 
 Built from fork `main`, starting with the 2 commits that were the old, narrower `capivara/macos-shm-fix`
 PR branch (kept — they're real and unrelated to the rest), then 3 new commits hand-extracted this pass:
@@ -45,6 +45,7 @@ PR branch (kept — they're real and unrelated to the rest), then 3 new commits 
 | 0007 | `host/gl: implement the missing angle_shader_translator C ABI` | New `ShaderTranslator.{h,cpp}` — the flat C ABI (`ST_*`) that `angle_shader_parser.cpp` `dlopen()`s as `libshadertranslator.{dylib,so,dll}` at runtime, wrapping ANGLE's real `sh::*` API. This file never existed anywhere (not in gfxstream, not in vanilla ANGLE, not in this fork's history) — `CMakeLists.txt` literally says the caller is responsible for providing it, and no caller ever did. Built as a standalone `cc_shared_library` via Bazel (`//host/gl/glestranslator/gles_v2:shadertranslator`), copied next to `libgfxstream_backend` by a Meson `custom_target` gated on `decoders=gles`. | Session work. Initial version had a real bug (see 0008) found by the boot test that 0008 documents — kept as its own commit since it's the structural piece (the ABI shape, the Bazel/Meson wiring), not the bugfix. |
 | 0008 | `third_party/angle, host/gl: fix ANGLE_ENABLE_GLSL gap, null nameHashingMap crash` | Two real bugs found by an actual boot test with `use_gles(true)`: (a) the `translator` Bazel target never defined `ANGLE_ENABLE_GLSL` (ANGLE's `CodeGen.cpp::ConstructCompiler()` gates every output backend behind its own `#ifdef`, and GLSL's was never set — upstream gfxstream's Linux path only ever needs Vulkan/SPIRV output, so this was never exercised before), so `sh::ConstructCompiler()` unconditionally returned null for every `ST_GLSL_*_OUTPUT` gfxstream's macOS host path requests. Added the define plus the ~15 missing `glsl/*.cpp`/`tree_ops/glsl/*.cpp` (incl. `apple/` subdir) source files that backend actually needs. (b) `ShaderTranslator.cpp`'s failure fallback path left `nameHashingMap` null, but the caller dereferences it unconditionally — caused a real `SIGSEGV` during the same boot test, before (a) was fixed. | **This is the actual root-cause fix for the multi-session GLES shader-compile blocker.** Confirmed nothing to do with Apple's ANGLE-over-Metal runtime (disproven in an earlier session) or `#version` pragmas (0005's old hypothesis) — it was always a missing preprocessor define in our own Bazel glue. |
 | 0009 | `host: close the ASG host/guest lost-wakeup race in RingStream::readRaw` | After publishing `ASG_HOST_STATE_NEED_NOTIFY`, issues a `StoreLoad` barrier and re-checks both rings before blocking on `onUnavailableRead()`. | Real race: the guest only pings when it observes `host_state == NEED_NOTIFY`; if it wrote a request and sampled `host_state` while still `CAN_CONSUME` (just before this store), it never pings, and the host's blocking receive sleeps forever on data already in the ring. Caused intermittent ~16s stalls on SurfaceFlinger/HWC's first host round-trip, tripping the Watchdog. Also ignores meson `*.stamp` build artifacts. |
+| 0010 | `host: invoke the completion callback when an export-sync fence isn't found` | `FrameBuffer::Impl::asyncWaitForGpuWithCb` now calls `cb()` before returning when `EmulatedEglFenceSync::getFromHandle` misses, instead of just logging and dropping it. | Same bug shape as 0009, different channel: `destroyWhenSignaled=true` fences self-remove from the registry as soon as they signal (via the render-control/pipe channel), but `GFXSTREAM_CREATE_EXPORT_SYNC` (a separate virtio-gpu command channel, no ordering guarantee) can arrive after that — "not found" then means "already done", not an error. The dropped callback left RanchuHwc's virtio-gpu timeline task (and the guest's `dma_fence_default_wait` backing a `presentDisplay` call) blocked forever. Confirmed live: a single "fence sync 0x... not found" log line at the exact moment `RanchuHwc`'s binder thread hung in `DrmVirtGpuResource::wait()`. |
 **Validated**: `meson setup -Ddecoders=vulkan --buildtype=debug && ninja` clean after 0003; `meson setup
 -Ddecoders=vulkan,gles,composer --buildtype=debug && ninja` clean after 0004 and 0005, run directly inside
 the fork clone after each commit. 0006/0007: full `decoders=vulkan,gles,composer` meson+ninja build clean
@@ -56,6 +57,11 @@ gfxstream's internal blit shader, and the renderer proceeds past shader compilat
 **0009: validated by a real boot** — `SurfaceFlinger` stable for 800s+ continuous boot (combined
 with libkrun 0009 and `crates/capy`'s `gralloc=minigbm`), zero crashes, where the unfixed race
 previously caused intermittent ~16s stalls.
+**0010: validated by a real boot** — with the `oemlock`/`frp` boot blockers also worked around
+(see README.md "Estado atual"), the exact "fence sync 0x... not found" hang that previously wedged
+`RanchuHwc`'s `presentDisplay` forever stopped recurring, and `system_server` survived roughly 10x
+longer (~700s vs. the prior ~65s Watchdog-kill ceiling) before hitting an unrelated, further-along
+blocker (`getCompositionColorSpaces`, not yet root-caused).
 
 0001-0005 carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
 2 pre-existing ones, at the repo owner's explicit instruction. 0006-0008 don't have that trailer yet —
@@ -115,3 +121,10 @@ Real, load-bearing code, not yet ported anywhere, no patch series exists for any
   binary Capivara has to ship because we don't run a Cuttlefish host companion (`cvd`). Validated
   workaround for the `OemLockService` boot blocker (see its own README), not yet wired into any
   boot path automatically.
+- `crates/capy/src/soc.rs`'s `DiskRole::Frp` (and the matching `--disk frp=<img>`/`androidboot.
+  partition_map` wiring in `main.rs`) is also Capivara-specific glue, not upstream material — it
+  teaches our own boot-contract builder about a partition role Cuttlefish's real disk layout
+  already has but our minimal test images didn't. The device-node permission fix it still needs
+  (`/dev/block/vdN` for `frp` lands as `root:root 0600` instead of `root:system 0660`, and `vold`
+  treats it as a delayed-scan removable disk instead of a fixed first-stage-init partition) is
+  validated only via manual `adb shell`, same not-yet-automated status as `tools/oemlock-stub/`.

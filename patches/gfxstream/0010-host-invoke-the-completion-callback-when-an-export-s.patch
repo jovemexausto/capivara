@@ -1,0 +1,60 @@
+From 54cdaffbf03f058d2331efcb06e213f01fd9408a Mon Sep 17 00:00:00 2001
+From: Capivara CI <ci@capivara.dev>
+Date: Fri, 26 Jun 2026 00:41:27 -0300
+Subject: [PATCH] host: invoke the completion callback when an export-sync
+ fence isn't found
+
+EmulatedEglFenceSync with destroyWhenSignaled=true removes itself from
+the handle registry as soon as it signals, via the render-control/pipe
+channel. The GFXSTREAM_CREATE_EXPORT_SYNC virtio-gpu command that
+leads to asyncWaitForGpuWithCb() arrives over a separate channel, with
+no ordering guarantee relative to that signal+self-destruct -- a sync
+that completes fast enough can vanish from the registry before this
+lookup runs.
+
+That's not an error, it means the wait is already satisfied. The
+previous code logged it and silently dropped the completion callback,
+leaving whoever's waiting on it (RanchuHwc's virtio-gpu timeline task,
+and transitively the guest's DRM fence wait backing a composite/
+present call) blocked forever -- a real Watchdog-tripping hang
+confirmed live: RanchuHwc's binder thread stuck in
+DrmVirtGpuResource::wait() -> dma_fence_default_wait, traced back to
+exactly this dropped callback via a single "fence sync 0x... not
+found" log line at the moment of the hang.
+
+Same bug shape as the ASG host/guest lost-wakeup race (ring_stream.cpp,
+0009): a cross-channel lifecycle race where "not found" should mean
+"already done", not "silently drop and hang forever".
+---
+ host/frame_buffer.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/host/frame_buffer.cpp b/host/frame_buffer.cpp
+index 669138722..9422ff487 100644
+--- a/host/frame_buffer.cpp
++++ b/host/frame_buffer.cpp
+@@ -4972,7 +4972,20 @@ void FrameBuffer::Impl::asyncWaitForGpuWithCb(uint64_t eglsync, FenceCompletionC
+     EmulatedEglFenceSync* fenceSync = EmulatedEglFenceSync::getFromHandle(eglsync);
+ 
+     if (!fenceSync) {
+-        GFXSTREAM_ERROR("err: fence sync 0x%llx not found", (unsigned long long)eglsync);
++        // EmulatedEglFenceSync with destroyWhenSignaled=true removes itself from the
++        // handle registry as soon as it signals (see decRef()/destroy()), via the
++        // render-control/pipe channel. The GFXSTREAM_CREATE_EXPORT_SYNC command that
++        // leads here arrives over the separate virtio-gpu command channel, with no
++        // ordering guarantee relative to that signal+self-destruct. A sync that
++        // signals fast enough can vanish from the registry before this lookup runs.
++        // That's not an error -- it means the wait is already satisfied -- so invoke
++        // the completion callback now instead of silently dropping it: dropping it
++        // leaves whoever's waiting on it (e.g. RanchuHwc's virtio-gpu timeline task,
++        // and transitively the guest's DRM fence wait backing a composite/present
++        // call) blocked forever.
++        GFXSTREAM_ERROR("fence sync 0x%llx not found, treating as already signaled",
++                         (unsigned long long)eglsync);
++        cb();
+         return;
+     }
+ 
+-- 
+2.53.0
+

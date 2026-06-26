@@ -11,6 +11,7 @@ pub enum DiskRole {
     Userdata,
     Metadata,
     Misc,
+    Frp,
     Other,
 }
 
@@ -28,6 +29,7 @@ impl DiskRole {
             "userdata" => Self::Userdata,
             "metadata" => Self::Metadata,
             "misc" => Self::Misc,
+            "frp" => Self::Frp,
             _ => Self::Other,
         }
     }
@@ -45,6 +47,7 @@ impl DiskRole {
             Self::Userdata => 8,
             Self::Metadata => 9,
             Self::Misc => 10,
+            Self::Frp => 11,
             Self::Other => 255,
         }
     }
@@ -150,6 +153,7 @@ impl SocModel {
                 }),
                 DiskRole::Metadata => Some("vdj".to_string()),
                 DiskRole::Misc => Some("vdk".to_string()),
+                DiskRole::Frp => Some("vdc".to_string()),
                 DiskRole::Vbmeta
                 | DiskRole::VbmetaSystem
                 | DiskRole::VbmetaVendorDlkm

@@ -623,6 +623,11 @@ fn build_boot_contract(args: &Args) -> anyhow::Result<BootContract> {
         let path = args.kernel.clone().unwrap();
         let mut cmdline = args.cmdline.clone();
         let has_userdata = soc.disks.iter().any(|disk| disk.role == DiskRole::Userdata);
+        // frp is attached as a separate --disk frp=<img> (not a partition inside the super
+        // GPT); it always lands right after super+userdata in attach order, since those are
+        // the only two disks with a lower DiskRole::priority() in the configurations we boot
+        // today -- see soc.rs.
+        let has_frp = soc.disks.iter().any(|disk| disk.role == DiskRole::Frp);
         let partition_map = if soc.uses_android_partition_map() {
             let mut entries = vec![
                 "vda1,boot_a",
@@ -638,6 +643,9 @@ fn build_boot_contract(args: &Args) -> anyhow::Result<BootContract> {
             ];
             if has_userdata {
                 entries.push("vdb,userdata");
+            }
+            if has_frp {
+                entries.push("vdc,frp");
             }
             Some(format!("androidboot.partition_map={}", entries.join(";")))
         } else {
