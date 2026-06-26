@@ -1,0 +1,99 @@
+From 05c81a9918c41919ae66e88145dec966bc3b6532 Mon Sep 17 00:00:00 2001
+From: Capivara CI <ci@capivara.dev>
+Date: Wed, 24 Jun 2026 03:00:08 -0300
+Subject: [PATCH 8/9] third_party/angle, host/gl: fix ANGLE_ENABLE_GLSL gap,
+ null nameHashingMap crash
+
+Boot-tested the GLES decoder for real (use_gles(true) against the
+ShaderTranslator shim from the previous commit) and found two more real
+bugs, both now fixed and re-validated by another real boot:
+
+1. third_party/angle/BUILD.angle.bazel's `translator` target never
+   defined ANGLE_ENABLE_GLSL/ANGLE_ENABLE_GLSL (CodeGen.cpp's
+   ConstructCompiler() gates each backend behind its own #ifdef, and
+   none of GLSL's were set) -- so sh::ConstructCompiler() unconditionally
+   returned null for ST_GLSL_*_OUTPUT, which is gfxstream's macOS host
+   GL path's *only* output type. Confirmed via a temporary diagnostic
+   print: ConstructCompiler got sane resources and valid spec/output
+   enums, just always got null back. This is what "ShaderTranslator:
+   failed to construct ANGLE compiler" / "Could not compile shader for
+   guest framebuffer blit" actually meant -- nothing to do with Apple's
+   ANGLE-over-Metal runtime (already disproven in an earlier session).
+   Added the missing srcs (glsl/*.cpp, tree_ops/glsl/*.cpp including the
+   apple/ subdir) alongside the defines -- upstream gfxstream never
+   needed desktop GLSL output (Linux path goes straight to Vulkan/SPIRV),
+   so this code was never wired into the Bazel target at all.
+
+2. ShaderTranslator.cpp's STCompileAndResolve() left `nameHashingMap`
+   null in the ConstructCompiler-failure fallback path, but
+   angle_shader_parser.cpp's translate() unconditionally dereferences
+   `compileResult->nameHashingMap->entryCount` -- a real SIGSEGV hit
+   during boot testing before fix #1 made ConstructCompiler succeed.
+   Always allocate an (possibly empty) nameHashingMap now.
+
+Validated: real boot via scripts/run-capy.sh with use_gles(true) --
+gfxstream's internal blit shader (texture_draw.cpp) now compiles
+successfully for both vertex and fragment stages (previously hit a
+SIGABRT from a GFXSTREAM_FATAL "Could not compile shader" log). The
+shader-compile blocker that has spanned several sessions is resolved.
+Not yet exercised: a real Android guest driving the full GLES decoder
+end-to-end (this was tested against a minimal /bin/sh root, which
+doesn't run a compositor).
+---
+ .../glestranslator/gles_v2/ShaderTranslator.cpp |  2 ++
+ third_party/angle/BUILD.angle.bazel             | 17 +++++++++++++++++
+ 2 files changed, 19 insertions(+)
+
+diff --git a/host/gl/glestranslator/gles_v2/ShaderTranslator.cpp b/host/gl/glestranslator/gles_v2/ShaderTranslator.cpp
+index da75a662f..bca3c84b7 100644
+--- a/host/gl/glestranslator/gles_v2/ShaderTranslator.cpp
++++ b/host/gl/glestranslator/gles_v2/ShaderTranslator.cpp
+@@ -378,6 +378,8 @@ void STCompileAndResolve(const ST_ShaderCompileInfo* info, ST_ShaderCompileResul
+     } else {
+         result->infoLog = strdup("ShaderTranslator: failed to construct ANGLE compiler");
+         result->translatedSource = strdup("");
++        result->nameHashingMap = new ST_NameHashingMap();
++        memset(result->nameHashingMap, 0, sizeof(*result->nameHashingMap));
+     }
+ 
+     *outResult = result;
+diff --git a/third_party/angle/BUILD.angle.bazel b/third_party/angle/BUILD.angle.bazel
+index d2d39a9e0..c17e92dd9 100644
+--- a/third_party/angle/BUILD.angle.bazel
++++ b/third_party/angle/BUILD.angle.bazel
+@@ -1409,8 +1409,23 @@ cc_library(
+         "src/compiler/translator/ValidateVaryingLocations.cpp",
+         "src/compiler/translator/VariablePacker.cpp",
+         "src/compiler/translator/blocklayout.cpp",
++        "src/compiler/translator/glsl/BuiltInFunctionEmulatorGLSL.cpp",
++        "src/compiler/translator/glsl/ExtensionGLSL.cpp",
++        "src/compiler/translator/glsl/OutputESSL.cpp",
+         "src/compiler/translator/glsl/OutputGLSL.cpp",
+         "src/compiler/translator/glsl/OutputGLSLBase.cpp",
++        "src/compiler/translator/glsl/TranslatorESSL.cpp",
++        "src/compiler/translator/glsl/TranslatorGLSL.cpp",
++        "src/compiler/translator/glsl/VersionGLSL.cpp",
++        "src/compiler/translator/tree_ops/glsl/RegenerateStructNames.cpp",
++        "src/compiler/translator/tree_ops/glsl/RewriteRepeatedAssignToSwizzled.cpp",
++        "src/compiler/translator/tree_ops/glsl/ScalarizeVecAndMatConstructorArgs.cpp",
++        "src/compiler/translator/tree_ops/glsl/UseInterfaceBlockFields.cpp",
++        "src/compiler/translator/tree_ops/glsl/apple/AddAndTrueToLoopCondition.cpp",
++        "src/compiler/translator/tree_ops/glsl/apple/RewriteDoWhile.cpp",
++        "src/compiler/translator/tree_ops/glsl/apple/RewriteRowMajorMatrices.cpp",
++        "src/compiler/translator/tree_ops/glsl/apple/RewriteUnaryMinusOperatorFloat.cpp",
++        "src/compiler/translator/tree_ops/glsl/apple/UnfoldShortCircuitAST.cpp",
+         "src/compiler/translator/glslang_lex_autogen.cpp",
+         "src/compiler/translator/glslang_tab_autogen.cpp",
+         "src/compiler/translator/spirv/BuildSPIRV.cpp",
+@@ -1718,6 +1733,8 @@ cc_library(
+     local_defines = [
+         "ANGLE_ENABLE_CONTEXT_MUTEX=1",
+         "ANGLE_ENABLE_SHARE_CONTEXT_LOCK=1",
++        "ANGLE_ENABLE_ESSL",
++        "ANGLE_ENABLE_GLSL",
+         "ANGLE_ENABLE_VULKAN",
+         "ANGLE_IS_LINUX",
+         "ANGLE_OUTSIDE_WEBKIT",
+-- 
+2.53.0
+

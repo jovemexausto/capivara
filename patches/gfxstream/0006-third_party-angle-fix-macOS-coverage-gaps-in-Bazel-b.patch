@@ -1,0 +1,73 @@
+From 2e146c02c029a9ea8e49c08d15f35370603e4576 Mon Sep 17 00:00:00 2001
+From: Capivara CI <ci@capivara.dev>
+Date: Wed, 24 Jun 2026 02:37:34 -0300
+Subject: [PATCH 6/9] third_party/angle: fix macOS coverage gaps in Bazel build
+ glue
+
+angle_common and angle_glslang's select()s on @platforms//os only had
+linux/windows branches, so building @angle//:translator on macOS picked
+no OS-specific sources at all for angle_common (silently empty, since
+there was no select() there to begin with -- system_utils_linux.cpp was
+hardcoded unconditionally) and failed to configure for angle_glslang
+(no matching condition, no default). Add macOS branches (POSIX, so the
+same Unix/system_utils_apple+mac sources apply) plus //conditions:default
+fallbacks. Verified with a full `bazel clean --expunge` + rebuild of
+@angle//:translator using only this tracked BUILD.angle.bazel, with no
+local ANGLE checkout on disk -- git_repository() fetches its own copy.
+
+Not Capivara-specific: any macOS+Bazel build of gfxstream's ANGLE
+vendoring hits this. Worth upstreaming.
+---
+ third_party/angle/BUILD.angle.bazel | 21 +++++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/third_party/angle/BUILD.angle.bazel b/third_party/angle/BUILD.angle.bazel
+index b28fcfd89..d2d39a9e0 100644
+--- a/third_party/angle/BUILD.angle.bazel
++++ b/third_party/angle/BUILD.angle.bazel
+@@ -31,13 +31,24 @@ cc_library(
+         "src/common/platform_helpers.cpp",
+         "src/common/string_utils.cpp",
+         "src/common/system_utils.cpp",
+-        "src/common/system_utils_linux.cpp",
+         "src/common/system_utils_posix.cpp",
+         "src/common/third_party/xxhash/xxhash.c",
+         "src/common/tls.cpp",
+         "src/common/uniform_type_info_autogen.cpp",
+         "src/common/utilities.cpp",
+-    ],
++    ] + select({
++        "@platforms//os:macos": [
++            "src/common/system_utils_apple.cpp",
++            "src/common/system_utils_mac.cpp",
++        ],
++        "@platforms//os:windows": [
++            "src/common/system_utils_win.cpp",
++            "src/common/system_utils_win32.cpp",
++        ],
++        "//conditions:default": [
++            "src/common/system_utils_linux.cpp",
++        ],
++    }),
+     hdrs = [
+         "src/common/BinaryStream.h",
+         "src/common/CircularBuffer.h",
+@@ -211,9 +222,15 @@ cc_library(
+         "@platforms//os:linux": [
+             "third_party/glslang/src/glslang/OSDependent/Unix/ossource.cpp",
+         ],
++        "@platforms//os:macos": [
++            "third_party/glslang/src/glslang/OSDependent/Unix/ossource.cpp",
++        ],
+         "@platforms//os:windows": [
+             "third_party/glslang/src/glslang/OSDependent/Windows/ossource.cpp",
+         ],
++        "//conditions:default": [
++            "third_party/glslang/src/glslang/OSDependent/Unix/ossource.cpp",
++        ],
+     }),
+     hdrs = glob([
+         "third_party/glslang/src/glslang/HLSL/*.h",
+-- 
+2.53.0
+

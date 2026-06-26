@@ -1,0 +1,890 @@
+From a871d4264d293b57de9628c5c4a90e12f77e051f Mon Sep 17 00:00:00 2001
+From: Capivara CI <ci@capivara.dev>
+Date: Wed, 24 Jun 2026 02:38:11 -0300
+Subject: [PATCH 7/9] host/gl: implement the missing angle_shader_translator C
+ ABI
+
+CMakeLists.txt's USE_ANGLE_SHADER_PARSER comment says "the caller of the
+cmake script is responsible to create the angle_shader_translator
+target" -- but no caller (Meson build, AOSP platform tree mirrored here,
+or any fork history checked) ever did. angle_shader_parser.cpp dlopen()s
+"libshadertranslator.{dylib,so,dll}" and resolves a flat C ABI (ST_*
+types, STInitialize/STCompileAndResolve/etc.) that doesn't exist
+anywhere in this tree, in vanilla ANGLE, or in this repo's history.
+
+Add ShaderTranslator.{h,cpp}: a thin wrapper translating that ST_* ABI
+to ANGLE's real public API (sh::Initialize/ConstructCompiler/Compile/
+GetUniforms/... in GLSLANG/ShaderLang.h), built as a standalone
+cc_shared_library (//host/gl/glestranslator/gles_v2:shadertranslator)
+linked against @angle//:translator. Wire USE_ANGLE_SHADER_PARSER into
+meson.build (gated on decoders=gles, never set before -- it only existed
+as an unwired CMake option), and add a Meson custom_target that invokes
+Bazel to build the shim and drops the resulting dylib next to
+libgfxstream_backend so it's on the existing DYLD_LIBRARY_PATH/
+LD_LIBRARY_PATH entry.
+
+ST_ShaderVariable/ST_InterfaceBlock field set was derived from actual
+consumers (program_data.cpp's struct/uniform-block validation logic),
+not guessed -- compiling against real callers caught a missing
+isRowMajorLayout field during this work.
+
+Validated: full decoders=vulkan,gles,composer meson+ninja build succeeds
+end to end; dlopen+dlsym+call of STInitialize() from a standalone test
+returns success. NOT YET validated against a real Android boot
+exercising the GLES decoder -- the actual shader compile/link path is
+untested beyond this.
+---
+ host/gl/glestranslator/gles_v2/BUILD.bazel    |  22 +-
+ .../gles_v2/ShaderTranslator.cpp              | 481 ++++++++++++++++++
+ .../glestranslator/gles_v2/ShaderTranslator.h | 255 ++++++++++
+ host/gl/glestranslator/gles_v2/meson.build    |  31 ++
+ meson.build                                   |   3 +
+ 5 files changed, 791 insertions(+), 1 deletion(-)
+ create mode 100644 host/gl/glestranslator/gles_v2/ShaderTranslator.cpp
+ create mode 100644 host/gl/glestranslator/gles_v2/ShaderTranslator.h
+
+diff --git a/host/gl/glestranslator/gles_v2/BUILD.bazel b/host/gl/glestranslator/gles_v2/BUILD.bazel
+index 16d96dc5a..7b2591ab9 100644
+--- a/host/gl/glestranslator/gles_v2/BUILD.bazel
++++ b/host/gl/glestranslator/gles_v2/BUILD.bazel
+@@ -1,4 +1,4 @@
+-load("@rules_cc//cc:defs.bzl", "cc_library")
++load("@rules_cc//cc:defs.bzl", "cc_library", "cc_shared_library")
+ load("//:build_variables.bzl", "GFXSTREAM_HOST_COPTS", "GFXSTREAM_HOST_DEFINES")
+ 
+ package(
+@@ -43,3 +43,23 @@ cc_library(
+     ],
+     alwayslink = True,
+ )
++
++# Standalone wrapper exposing ANGLE's shader translator as a flat C ABI (ST_*), dlopen()ed at
++# runtime by angle_shader_parser.cpp (see ShaderTranslator.h). Built separately from
++# gles_v2_translator_static because the actual gfxstream binary build (Meson) never links ANGLE
++# directly -- only this small shim does, and gfxstream loads it as a prebuilt shared library at
++# runtime, keeping the ~20MB ANGLE translator out of the main process image.
++cc_library(
++    name = "shadertranslator_impl",
++    srcs = ["ShaderTranslator.cpp"],
++    hdrs = ["ShaderTranslator.h"],
++    deps = [
++        "@angle//:angle_translator_headers",
++        "@angle//:translator",
++    ],
++)
++
++cc_shared_library(
++    name = "shadertranslator",
++    deps = [":shadertranslator_impl"],
++)
+diff --git a/host/gl/glestranslator/gles_v2/ShaderTranslator.cpp b/host/gl/glestranslator/gles_v2/ShaderTranslator.cpp
+new file mode 100644
+index 000000000..da75a662f
+--- /dev/null
++++ b/host/gl/glestranslator/gles_v2/ShaderTranslator.cpp
+@@ -0,0 +1,481 @@
++// ShaderTranslator.cpp: implementation of the ST_* C-ABI declared in ShaderTranslator.h, wrapping
++// ANGLE's real public API (sh::* in GLSLANG/ShaderLang.h). Built into a standalone shared library
++// (libshadertranslator.{dylib,so,dll}) linked against ANGLE's `translator` static lib; never
++// linked into the main gfxstream binary.
++
++#include "ShaderTranslator.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <map>
++#include <string>
++#include <vector>
++
++#include <GLSLANG/ShaderLang.h>
++
++namespace {
++
++ShShaderSpec convertSpec(ST_ShaderSpec spec) {
++    switch (spec) {
++        case ST_GLES2_SPEC:
++            return SH_GLES2_SPEC;
++        case ST_GLES3_SPEC:
++            return SH_GLES3_SPEC;
++        case ST_GLES3_1_SPEC:
++            return SH_GLES3_1_SPEC;
++    }
++    return SH_GLES3_1_SPEC;
++}
++
++ShShaderOutput convertOutput(ST_ShaderOutput output) {
++    switch (output) {
++        case ST_GLSL_COMPATIBILITY_OUTPUT:
++            return SH_GLSL_COMPATIBILITY_OUTPUT;
++        case ST_GLSL_150_CORE_OUTPUT:
++            return SH_GLSL_150_CORE_OUTPUT;
++        case ST_GLSL_330_CORE_OUTPUT:
++            return SH_GLSL_330_CORE_OUTPUT;
++        case ST_GLSL_430_CORE_OUTPUT:
++            return SH_GLSL_430_CORE_OUTPUT;
++    }
++    return SH_GLSL_430_CORE_OUTPUT;
++}
++
++// Overrides the subset of fields gfxstream actually edits; everything else keeps whatever
++// sh::InitBuiltInResources() already set as ANGLE's own defaults.
++void applyResourceOverrides(const ST_BuiltInResources& in, ShBuiltInResources* out) {
++    out->MaxVertexAttribs = in.MaxVertexAttribs;
++    out->MaxVertexUniformVectors = in.MaxVertexUniformVectors;
++    out->MaxVaryingVectors = in.MaxVaryingVectors;
++    out->MaxVertexTextureImageUnits = in.MaxVertexTextureImageUnits;
++    out->MaxCombinedTextureImageUnits = in.MaxCombinedTextureImageUnits;
++    out->MaxTextureImageUnits = in.MaxTextureImageUnits;
++    out->MaxFragmentUniformVectors = in.MaxFragmentUniformVectors;
++    out->MaxDrawBuffers = in.MaxDrawBuffers;
++
++    out->OES_standard_derivatives = in.OES_standard_derivatives;
++    out->OES_EGL_image_external = in.OES_EGL_image_external;
++    out->OES_EGL_image_external_essl3 = in.OES_EGL_image_external_essl3;
++    out->NV_EGL_stream_consumer_external = in.NV_EGL_stream_consumer_external;
++    out->ARB_texture_rectangle = in.ARB_texture_rectangle;
++    out->EXT_blend_func_extended = in.EXT_blend_func_extended;
++    out->EXT_conservative_depth = in.EXT_conservative_depth;
++    out->EXT_draw_buffers = in.EXT_draw_buffers;
++    out->EXT_frag_depth = in.EXT_frag_depth;
++    out->EXT_shader_texture_lod = in.EXT_shader_texture_lod;
++    out->EXT_shader_framebuffer_fetch = in.EXT_shader_framebuffer_fetch;
++    out->EXT_shader_framebuffer_fetch_non_coherent = in.EXT_shader_framebuffer_fetch_non_coherent;
++    out->NV_shader_framebuffer_fetch = in.NV_shader_framebuffer_fetch;
++    out->NV_shader_noperspective_interpolation = in.NV_shader_noperspective_interpolation;
++    out->ARM_shader_framebuffer_fetch = in.ARM_shader_framebuffer_fetch;
++    out->ARM_shader_framebuffer_fetch_depth_stencil = in.ARM_shader_framebuffer_fetch_depth_stencil;
++    out->OVR_multiview = in.OVR_multiview;
++    out->OVR_multiview2 = in.OVR_multiview2;
++    out->EXT_multisampled_render_to_texture = in.EXT_multisampled_render_to_texture;
++    out->EXT_multisampled_render_to_texture2 = in.EXT_multisampled_render_to_texture2;
++    out->EXT_YUV_target = in.EXT_YUV_target;
++    out->EXT_geometry_shader = in.EXT_geometry_shader;
++    out->OES_geometry_shader = in.OES_geometry_shader;
++    out->OES_shader_io_blocks = in.OES_shader_io_blocks;
++    out->EXT_shader_io_blocks = in.EXT_shader_io_blocks;
++    out->EXT_gpu_shader5 = in.EXT_gpu_shader5;
++    out->OES_gpu_shader5 = in.OES_gpu_shader5;
++    out->EXT_shader_non_constant_global_initializers = in.EXT_shader_non_constant_global_initializers;
++    out->OES_texture_storage_multisample_2d_array = in.OES_texture_storage_multisample_2d_array;
++    out->OES_texture_3D = in.OES_texture_3D;
++    out->ANGLE_shader_pixel_local_storage = in.ANGLE_shader_pixel_local_storage;
++    out->ANGLE_texture_multisample = in.ANGLE_texture_multisample;
++    out->ANGLE_multi_draw = in.ANGLE_multi_draw;
++    out->ANGLE_base_vertex_base_instance = in.ANGLE_base_vertex_base_instance;
++    out->WEBGL_video_texture = in.WEBGL_video_texture;
++    out->APPLE_clip_distance = in.APPLE_clip_distance;
++    out->OES_texture_cube_map_array = in.OES_texture_cube_map_array;
++    out->EXT_texture_cube_map_array = in.EXT_texture_cube_map_array;
++    out->EXT_texture_query_lod = in.EXT_texture_query_lod;
++    out->EXT_texture_shadow_lod = in.EXT_texture_shadow_lod;
++    out->EXT_shadow_samplers = in.EXT_shadow_samplers;
++    out->OES_shader_multisample_interpolation = in.OES_shader_multisample_interpolation;
++    out->OES_shader_image_atomic = in.OES_shader_image_atomic;
++    out->EXT_tessellation_shader = in.EXT_tessellation_shader;
++    out->OES_tessellation_shader = in.OES_tessellation_shader;
++    out->OES_texture_buffer = in.OES_texture_buffer;
++    out->EXT_texture_buffer = in.EXT_texture_buffer;
++    out->OES_sample_variables = in.OES_sample_variables;
++    out->EXT_clip_cull_distance = in.EXT_clip_cull_distance;
++    out->ANGLE_clip_cull_distance = in.ANGLE_clip_cull_distance;
++    out->EXT_primitive_bounding_box = in.EXT_primitive_bounding_box;
++    out->OES_primitive_bounding_box = in.OES_primitive_bounding_box;
++    out->EXT_separate_shader_objects = in.EXT_separate_shader_objects;
++    out->ANGLE_base_vertex_base_instance_shader_builtin = in.ANGLE_base_vertex_base_instance_shader_builtin;
++    out->ANDROID_extension_pack_es31a = in.ANDROID_extension_pack_es31a;
++    out->KHR_blend_equation_advanced = in.KHR_blend_equation_advanced;
++
++    out->NV_draw_buffers = in.NV_draw_buffers;
++    out->FragmentPrecisionHigh = in.FragmentPrecisionHigh;
++
++    out->MaxVertexOutputVectors = in.MaxVertexOutputVectors;
++    out->MaxFragmentInputVectors = in.MaxFragmentInputVectors;
++    out->MinProgramTexelOffset = in.MinProgramTexelOffset;
++    out->MaxProgramTexelOffset = in.MaxProgramTexelOffset;
++
++    out->MaxDualSourceDrawBuffers = in.MaxDualSourceDrawBuffers;
++
++    out->MaxProgramTextureGatherOffset = in.MaxProgramTextureGatherOffset;
++    out->MinProgramTextureGatherOffset = in.MinProgramTextureGatherOffset;
++    out->MaxImageUnits = in.MaxImageUnits;
++    out->MaxComputeImageUniforms = in.MaxComputeImageUniforms;
++    out->MaxVertexImageUniforms = in.MaxVertexImageUniforms;
++    out->MaxFragmentImageUniforms = in.MaxFragmentImageUniforms;
++    out->MaxCombinedImageUniforms = in.MaxCombinedImageUniforms;
++    out->MaxCombinedShaderOutputResources = in.MaxCombinedShaderOutputResources;
++    out->MaxUniformLocations = in.MaxUniformLocations;
++    for (int i = 0; i < 3; ++i) {
++        out->MaxComputeWorkGroupCount[i] = in.MaxComputeWorkGroupCount[i];
++        out->MaxComputeWorkGroupSize[i] = in.MaxComputeWorkGroupSize[i];
++    }
++    out->MaxComputeUniformComponents = in.MaxComputeUniformComponents;
++    out->MaxComputeTextureImageUnits = in.MaxComputeTextureImageUnits;
++    out->MaxComputeAtomicCounters = in.MaxComputeAtomicCounters;
++    out->MaxComputeAtomicCounterBuffers = in.MaxComputeAtomicCounterBuffers;
++    out->MaxVertexAtomicCounters = in.MaxVertexAtomicCounters;
++    out->MaxFragmentAtomicCounters = in.MaxFragmentAtomicCounters;
++    out->MaxCombinedAtomicCounters = in.MaxCombinedAtomicCounters;
++    out->MaxAtomicCounterBindings = in.MaxAtomicCounterBindings;
++    out->MaxVertexAtomicCounterBuffers = in.MaxVertexAtomicCounterBuffers;
++    out->MaxFragmentAtomicCounterBuffers = in.MaxFragmentAtomicCounterBuffers;
++    out->MaxCombinedAtomicCounterBuffers = in.MaxCombinedAtomicCounterBuffers;
++    out->MaxAtomicCounterBufferSize = in.MaxAtomicCounterBufferSize;
++    out->MaxUniformBufferBindings = in.MaxUniformBufferBindings;
++    out->MaxShaderStorageBufferBindings = in.MaxShaderStorageBufferBindings;
++}
++
++void copyResourcesFromSh(const ShBuiltInResources& in, ST_BuiltInResources* out) {
++    memset(out, 0, sizeof(*out));
++    out->MaxVertexAttribs = in.MaxVertexAttribs;
++    out->MaxVertexUniformVectors = in.MaxVertexUniformVectors;
++    out->MaxVaryingVectors = in.MaxVaryingVectors;
++    out->MaxVertexTextureImageUnits = in.MaxVertexTextureImageUnits;
++    out->MaxCombinedTextureImageUnits = in.MaxCombinedTextureImageUnits;
++    out->MaxTextureImageUnits = in.MaxTextureImageUnits;
++    out->MaxFragmentUniformVectors = in.MaxFragmentUniformVectors;
++    out->MaxDrawBuffers = in.MaxDrawBuffers;
++    out->FragmentPrecisionHigh = in.FragmentPrecisionHigh;
++    out->MaxVertexOutputVectors = in.MaxVertexOutputVectors;
++    out->MaxFragmentInputVectors = in.MaxFragmentInputVectors;
++    out->MinProgramTexelOffset = in.MinProgramTexelOffset;
++    out->MaxProgramTexelOffset = in.MaxProgramTexelOffset;
++    out->MaxDualSourceDrawBuffers = in.MaxDualSourceDrawBuffers;
++    out->OES_standard_derivatives = in.OES_standard_derivatives;
++    out->OES_EGL_image_external = in.OES_EGL_image_external;
++    out->EXT_gpu_shader5 = in.EXT_gpu_shader5;
++    out->EXT_shader_framebuffer_fetch = in.EXT_shader_framebuffer_fetch;
++    out->MaxProgramTextureGatherOffset = in.MaxProgramTextureGatherOffset;
++    out->MinProgramTextureGatherOffset = in.MinProgramTextureGatherOffset;
++    out->MaxImageUnits = in.MaxImageUnits;
++    out->MaxComputeImageUniforms = in.MaxComputeImageUniforms;
++    out->MaxVertexImageUniforms = in.MaxVertexImageUniforms;
++    out->MaxFragmentImageUniforms = in.MaxFragmentImageUniforms;
++    out->MaxCombinedImageUniforms = in.MaxCombinedImageUniforms;
++    out->MaxCombinedShaderOutputResources = in.MaxCombinedShaderOutputResources;
++    out->MaxUniformLocations = in.MaxUniformLocations;
++    for (int i = 0; i < 3; ++i) {
++        out->MaxComputeWorkGroupCount[i] = in.MaxComputeWorkGroupCount[i];
++        out->MaxComputeWorkGroupSize[i] = in.MaxComputeWorkGroupSize[i];
++    }
++    out->MaxComputeUniformComponents = in.MaxComputeUniformComponents;
++    out->MaxComputeTextureImageUnits = in.MaxComputeTextureImageUnits;
++    out->MaxComputeAtomicCounters = in.MaxComputeAtomicCounters;
++    out->MaxComputeAtomicCounterBuffers = in.MaxComputeAtomicCounterBuffers;
++    out->MaxVertexAtomicCounters = in.MaxVertexAtomicCounters;
++    out->MaxFragmentAtomicCounters = in.MaxFragmentAtomicCounters;
++    out->MaxCombinedAtomicCounters = in.MaxCombinedAtomicCounters;
++    out->MaxAtomicCounterBindings = in.MaxAtomicCounterBindings;
++    out->MaxVertexAtomicCounterBuffers = in.MaxVertexAtomicCounterBuffers;
++    out->MaxFragmentAtomicCounterBuffers = in.MaxFragmentAtomicCounterBuffers;
++    out->MaxCombinedAtomicCounterBuffers = in.MaxCombinedAtomicCounterBuffers;
++    out->MaxAtomicCounterBufferSize = in.MaxAtomicCounterBufferSize;
++    out->MaxUniformBufferBindings = in.MaxUniformBufferBindings;
++    out->MaxShaderStorageBufferBindings = in.MaxShaderStorageBufferBindings;
++}
++
++ST_ShaderVariable convertVariable(const sh::ShaderVariable& var) {
++    ST_ShaderVariable out;
++    memset(&out, 0, sizeof(out));
++    out.type = var.type;
++    out.precision = var.precision;
++    out.name = strdup(var.name.c_str());
++    out.location = var.location;
++    out.staticUse = var.staticUse;
++    out.isRowMajorLayout = var.isRowMajorLayout;
++
++    out.arraySizeCount = static_cast<uint32_t>(var.arraySizes.size());
++    if (out.arraySizeCount) {
++        out.pArraySizes = static_cast<unsigned int*>(malloc(sizeof(unsigned int) * out.arraySizeCount));
++        for (uint32_t i = 0; i < out.arraySizeCount; ++i) {
++            out.pArraySizes[i] = var.arraySizes[i];
++        }
++    }
++
++    out.fieldsCount = static_cast<uint32_t>(var.fields.size());
++    if (out.fieldsCount) {
++        out.pFields = static_cast<ST_ShaderVariable*>(
++            malloc(sizeof(ST_ShaderVariable) * out.fieldsCount));
++        for (uint32_t i = 0; i < out.fieldsCount; ++i) {
++            out.pFields[i] = convertVariable(var.fields[i]);
++        }
++    }
++    return out;
++}
++
++ST_InterfaceBlock convertInterfaceBlock(const sh::InterfaceBlock& block) {
++    ST_InterfaceBlock out;
++    memset(&out, 0, sizeof(out));
++    out.name = strdup(block.name.c_str());
++    out.layout = static_cast<int>(block.layout);
++    out.isRowMajorLayout = block.isRowMajorLayout;
++    out.binding = block.binding;
++
++    out.fieldsCount = static_cast<uint32_t>(block.fields.size());
++    if (out.fieldsCount) {
++        out.pFields = static_cast<ST_ShaderVariable*>(
++            malloc(sizeof(ST_ShaderVariable) * out.fieldsCount));
++        for (uint32_t i = 0; i < out.fieldsCount; ++i) {
++            out.pFields[i] = convertVariable(block.fields[i]);
++        }
++    }
++    return out;
++}
++
++template <class T, class ConvertFn>
++void convertVectorToArray(const std::vector<T>& in, uint32_t* outCount, ST_ShaderVariable** outArr,
++                           ConvertFn convert) {
++    *outCount = static_cast<uint32_t>(in.size());
++    if (*outCount == 0) {
++        *outArr = nullptr;
++        return;
++    }
++    *outArr = static_cast<ST_ShaderVariable*>(malloc(sizeof(ST_ShaderVariable) * (*outCount)));
++    for (uint32_t i = 0; i < *outCount; ++i) {
++        (*outArr)[i] = convert(in[i]);
++    }
++}
++
++void destroyVariableContents(ST_ShaderVariable* var) {
++    if (!var) return;
++    free(var->name);
++    free(var->pArraySizes);
++    if (var->pFields) {
++        for (uint32_t i = 0; i < var->fieldsCount; ++i) {
++            destroyVariableContents(&var->pFields[i]);
++        }
++        free(var->pFields);
++    }
++    memset(var, 0, sizeof(*var));
++}
++
++void destroyVariableArray(ST_ShaderVariable* arr, uint32_t count) {
++    if (!arr) return;
++    for (uint32_t i = 0; i < count; ++i) {
++        destroyVariableContents(&arr[i]);
++    }
++    free(arr);
++}
++
++}  // namespace
++
++extern "C" {
++
++bool STInitialize(void) { return sh::Initialize(); }
++
++bool STFinalize(void) { return sh::Finalize(); }
++
++void STGenerateResources(ST_BuiltInResources* outResources) {
++    ShBuiltInResources shRes;
++    sh::InitBuiltInResources(&shRes);
++    copyResourcesFromSh(shRes, outResources);
++}
++
++void STCompileAndResolve(const ST_ShaderCompileInfo* info, ST_ShaderCompileResult** outResult) {
++    ShHandle handle = static_cast<ShHandle>(info->handle);
++
++    if (!handle) {
++        ShBuiltInResources shRes;
++        sh::InitBuiltInResources(&shRes);
++        if (info->resources) {
++            applyResourceOverrides(*info->resources, &shRes);
++        }
++        handle = sh::ConstructCompiler(info->shaderType, convertSpec(info->spec),
++                                        convertOutput(info->output), &shRes);
++    }
++
++    ShCompileOptions opts;
++    opts.objectCode = (info->compileOptions & ST_OBJECT_CODE) ? 1 : 0;
++    opts.initOutputVariables = 0;
++
++    const char* shaderStrings[] = {info->shaderSource};
++    bool ok = handle && sh::Compile(handle, shaderStrings, 1, opts);
++
++    ST_ShaderCompileResult* result = new ST_ShaderCompileResult();
++    memset(result, 0, sizeof(*result));
++    result->outputHandle = static_cast<ST_Handle>(handle);
++    result->compileStatus = ok ? 1 : 0;
++
++    if (handle) {
++        result->infoLog = strdup(sh::GetInfoLog(handle).c_str());
++        result->translatedSource = strdup(sh::GetObjectCode(handle).c_str());
++
++        const std::map<std::string, std::string>* nameMap = sh::GetNameHashingMap(handle);
++        ST_NameHashingMap* outMap = new ST_NameHashingMap();
++        memset(outMap, 0, sizeof(*outMap));
++        if (nameMap && !nameMap->empty()) {
++            outMap->entryCount = static_cast<uint32_t>(nameMap->size());
++            outMap->ppUserNames = static_cast<const char**>(
++                malloc(sizeof(char*) * outMap->entryCount));
++            outMap->ppCompiledNames = static_cast<const char**>(
++                malloc(sizeof(char*) * outMap->entryCount));
++            uint32_t i = 0;
++            for (const auto& entry : *nameMap) {
++                outMap->ppUserNames[i] = strdup(entry.first.c_str());
++                outMap->ppCompiledNames[i] = strdup(entry.second.c_str());
++                ++i;
++            }
++        }
++        result->nameHashingMap = outMap;
++
++        if (ok && (info->compileOptions & ST_VARIABLES)) {
++            auto convert = [](const sh::ShaderVariable& v) { return convertVariable(v); };
++            if (auto* uniforms = sh::GetUniforms(handle)) {
++                convertVectorToArray(*uniforms, &result->uniformsCount, &result->pUniforms, convert);
++            }
++            if (auto* inputVaryings = sh::GetInputVaryings(handle)) {
++                convertVectorToArray(*inputVaryings, &result->inputVaryingsCount,
++                                      &result->pInputVaryings, convert);
++            }
++            if (auto* outputVaryings = sh::GetOutputVaryings(handle)) {
++                convertVectorToArray(*outputVaryings, &result->outputVaryingsCount,
++                                      &result->pOutputVaryings, convert);
++            }
++            if (auto* attributes = sh::GetAttributes(handle)) {
++                convertVectorToArray(*attributes, &result->allAttributesCount,
++                                      &result->pAllAttributes, convert);
++            }
++            if (auto* outputVars = sh::GetOutputVariables(handle)) {
++                convertVectorToArray(*outputVars, &result->activeOutputVariablesCount,
++                                      &result->pActiveOutputVariables, convert);
++            }
++            if (auto* uniformBlocks = sh::GetUniformBlocks(handle)) {
++                result->uniformBlocksCount = static_cast<uint32_t>(uniformBlocks->size());
++                if (result->uniformBlocksCount) {
++                    result->pUniformBlocks = static_cast<ST_InterfaceBlock*>(
++                        malloc(sizeof(ST_InterfaceBlock) * result->uniformBlocksCount));
++                    for (uint32_t i = 0; i < result->uniformBlocksCount; ++i) {
++                        result->pUniformBlocks[i] = convertInterfaceBlock((*uniformBlocks)[i]);
++                    }
++                }
++            }
++        }
++    } else {
++        result->infoLog = strdup("ShaderTranslator: failed to construct ANGLE compiler");
++        result->translatedSource = strdup("");
++    }
++
++    *outResult = result;
++}
++
++void STFreeShaderResolveState(ST_ShaderCompileResult* result) {
++    if (!result) return;
++
++    free(result->infoLog);
++    free(result->translatedSource);
++
++    if (result->nameHashingMap) {
++        for (uint32_t i = 0; i < result->nameHashingMap->entryCount; ++i) {
++            free(const_cast<char*>(result->nameHashingMap->ppUserNames[i]));
++            free(const_cast<char*>(result->nameHashingMap->ppCompiledNames[i]));
++        }
++        free(result->nameHashingMap->ppUserNames);
++        free(result->nameHashingMap->ppCompiledNames);
++        delete result->nameHashingMap;
++    }
++
++    destroyVariableArray(result->pUniforms, result->uniformsCount);
++    destroyVariableArray(result->pInputVaryings, result->inputVaryingsCount);
++    destroyVariableArray(result->pOutputVaryings, result->outputVaryingsCount);
++    destroyVariableArray(result->pAllAttributes, result->allAttributesCount);
++    destroyVariableArray(result->pActiveOutputVariables, result->activeOutputVariablesCount);
++
++    if (result->pUniformBlocks) {
++        for (uint32_t i = 0; i < result->uniformBlocksCount; ++i) {
++            ST_InterfaceBlock* block = &result->pUniformBlocks[i];
++            free(block->name);
++            destroyVariableArray(block->pFields, block->fieldsCount);
++        }
++        free(result->pUniformBlocks);
++    }
++
++    delete result;
++}
++
++ST_ShaderVariable STCopyVariable(const ST_ShaderVariable* var) {
++    ST_ShaderVariable out;
++    memset(&out, 0, sizeof(out));
++    if (!var) return out;
++
++    out.type = var->type;
++    out.precision = var->precision;
++    out.name = var->name ? strdup(var->name) : nullptr;
++    out.location = var->location;
++    out.staticUse = var->staticUse;
++    out.isRowMajorLayout = var->isRowMajorLayout;
++
++    out.arraySizeCount = var->arraySizeCount;
++    if (out.arraySizeCount) {
++        out.pArraySizes = static_cast<unsigned int*>(malloc(sizeof(unsigned int) * out.arraySizeCount));
++        memcpy(out.pArraySizes, var->pArraySizes, sizeof(unsigned int) * out.arraySizeCount);
++    }
++
++    out.fieldsCount = var->fieldsCount;
++    if (out.fieldsCount) {
++        out.pFields = static_cast<ST_ShaderVariable*>(
++            malloc(sizeof(ST_ShaderVariable) * out.fieldsCount));
++        for (uint32_t i = 0; i < out.fieldsCount; ++i) {
++            out.pFields[i] = STCopyVariable(&var->pFields[i]);
++        }
++    }
++    return out;
++}
++
++ST_InterfaceBlock STCopyInterfaceBlock(const ST_InterfaceBlock* block) {
++    ST_InterfaceBlock out;
++    memset(&out, 0, sizeof(out));
++    if (!block) return out;
++
++    out.name = block->name ? strdup(block->name) : nullptr;
++    out.layout = block->layout;
++    out.isRowMajorLayout = block->isRowMajorLayout;
++    out.binding = block->binding;
++
++    out.fieldsCount = block->fieldsCount;
++    if (out.fieldsCount) {
++        out.pFields = static_cast<ST_ShaderVariable*>(
++            malloc(sizeof(ST_ShaderVariable) * out.fieldsCount));
++        for (uint32_t i = 0; i < out.fieldsCount; ++i) {
++            out.pFields[i] = STCopyVariable(&block->pFields[i]);
++        }
++    }
++    return out;
++}
++
++void STDestroyVariable(ST_ShaderVariable* var) { destroyVariableContents(var); }
++
++void STDestroyInterfaceBlock(ST_InterfaceBlock* block) {
++    if (!block) return;
++    free(block->name);
++    destroyVariableArray(block->pFields, block->fieldsCount);
++    block->name = nullptr;
++    block->pFields = nullptr;
++    block->fieldsCount = 0;
++}
++
++}  // extern "C"
+diff --git a/host/gl/glestranslator/gles_v2/ShaderTranslator.h b/host/gl/glestranslator/gles_v2/ShaderTranslator.h
+new file mode 100644
+index 000000000..cea92ceba
+--- /dev/null
++++ b/host/gl/glestranslator/gles_v2/ShaderTranslator.h
+@@ -0,0 +1,255 @@
++// ShaderTranslator.h: flat C-ABI wrapper around ANGLE's shader translator (sh::* in
++// GLSLANG/ShaderLang.h), built as a standalone shared library (libshadertranslator.{dylib,so,dll})
++// that gfxstream dlopen()s at runtime via angle_shader_parser.cpp. The real ANGLE translator
++// (~20MB static lib, built via Bazel from third_party/angle) is linked only into this small
++// library, never into the main gfxstream binary -- keeping the heavy ANGLE dependency isolated.
++//
++// All types here are plain PODs with no ANGLE/STL types in their public layout, so this header
++// can be included by gfxstream host code that never links against ANGLE itself (it only calls
++// through the function pointers in STDispatch, resolved via dlsym at runtime).
++
++#pragma once
++
++#include <stdint.h>
++
++#include <GLES2/gl2.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef void* ST_Handle;
++
++typedef enum ST_ShaderSpec {
++    ST_GLES2_SPEC,
++    ST_GLES3_SPEC,
++    ST_GLES3_1_SPEC,
++} ST_ShaderSpec;
++
++typedef enum ST_ShaderOutput {
++    ST_GLSL_COMPATIBILITY_OUTPUT,
++    ST_GLSL_150_CORE_OUTPUT,
++    ST_GLSL_330_CORE_OUTPUT,
++    ST_GLSL_430_CORE_OUTPUT,
++} ST_ShaderOutput;
++
++enum {
++    ST_OBJECT_CODE = 1 << 0,
++    ST_VARIABLES = 1 << 1,
++};
++
++// Mirrors GLSLANG/ShaderLang.h's ShBuiltInResources field-for-field. Kept as an independent,
++// trivially-constructible POD (no ANGLE ctor dependency) so gfxstream host code can default- and
++// zero-construct it without linking ANGLE; the dylib converts to/from the real ShBuiltInResources
++// internally.
++typedef struct ST_BuiltInResources {
++    int MaxVertexAttribs;
++    int MaxVertexUniformVectors;
++    int MaxVaryingVectors;
++    int MaxVertexTextureImageUnits;
++    int MaxCombinedTextureImageUnits;
++    int MaxTextureImageUnits;
++    int MaxFragmentUniformVectors;
++    int MaxDrawBuffers;
++
++    int OES_standard_derivatives;
++    int OES_EGL_image_external;
++    int OES_EGL_image_external_essl3;
++    int NV_EGL_stream_consumer_external;
++    int ARB_texture_rectangle;
++    int EXT_blend_func_extended;
++    int EXT_conservative_depth;
++    int EXT_draw_buffers;
++    int EXT_frag_depth;
++    int EXT_shader_texture_lod;
++    int EXT_shader_framebuffer_fetch;
++    int EXT_shader_framebuffer_fetch_non_coherent;
++    int NV_shader_framebuffer_fetch;
++    int NV_shader_noperspective_interpolation;
++    int ARM_shader_framebuffer_fetch;
++    int ARM_shader_framebuffer_fetch_depth_stencil;
++    int OVR_multiview;
++    int OVR_multiview2;
++    int EXT_multisampled_render_to_texture;
++    int EXT_multisampled_render_to_texture2;
++    int EXT_YUV_target;
++    int EXT_geometry_shader;
++    int OES_geometry_shader;
++    int OES_shader_io_blocks;
++    int EXT_shader_io_blocks;
++    int EXT_gpu_shader5;
++    int OES_gpu_shader5;
++    int EXT_shader_non_constant_global_initializers;
++    int OES_texture_storage_multisample_2d_array;
++    int OES_texture_3D;
++    int ANGLE_shader_pixel_local_storage;
++    int ANGLE_texture_multisample;
++    int ANGLE_multi_draw;
++    int ANGLE_base_vertex_base_instance;
++    int WEBGL_video_texture;
++    int APPLE_clip_distance;
++    int OES_texture_cube_map_array;
++    int EXT_texture_cube_map_array;
++    int EXT_texture_query_lod;
++    int EXT_texture_shadow_lod;
++    int EXT_shadow_samplers;
++    int OES_shader_multisample_interpolation;
++    int OES_shader_image_atomic;
++    int EXT_tessellation_shader;
++    int OES_tessellation_shader;
++    int OES_texture_buffer;
++    int EXT_texture_buffer;
++    int OES_sample_variables;
++    int EXT_clip_cull_distance;
++    int ANGLE_clip_cull_distance;
++    int EXT_primitive_bounding_box;
++    int OES_primitive_bounding_box;
++    int EXT_separate_shader_objects;
++    int ANGLE_base_vertex_base_instance_shader_builtin;
++    int ANDROID_extension_pack_es31a;
++    int KHR_blend_equation_advanced;
++
++    int NV_draw_buffers;
++    int FragmentPrecisionHigh;
++
++    int MaxVertexOutputVectors;
++    int MaxFragmentInputVectors;
++    int MinProgramTexelOffset;
++    int MaxProgramTexelOffset;
++
++    int MaxDualSourceDrawBuffers;
++
++    // GLES 3.1 / compute constants.
++    int MaxProgramTextureGatherOffset;
++    int MinProgramTextureGatherOffset;
++    int MaxImageUnits;
++    int MaxComputeImageUniforms;
++    int MaxVertexImageUniforms;
++    int MaxFragmentImageUniforms;
++    int MaxCombinedImageUniforms;
++    int MaxCombinedShaderOutputResources;
++    int MaxUniformLocations;
++    int MaxComputeWorkGroupCount[3];
++    int MaxComputeWorkGroupSize[3];
++    int MaxComputeUniformComponents;
++    int MaxComputeTextureImageUnits;
++    int MaxComputeAtomicCounters;
++    int MaxComputeAtomicCounterBuffers;
++    int MaxVertexAtomicCounters;
++    int MaxFragmentAtomicCounters;
++    int MaxCombinedAtomicCounters;
++    int MaxAtomicCounterBindings;
++    int MaxVertexAtomicCounterBuffers;
++    int MaxFragmentAtomicCounterBuffers;
++    int MaxCombinedAtomicCounterBuffers;
++    int MaxAtomicCounterBufferSize;
++    int MaxUniformBufferBindings;
++    int MaxShaderStorageBufferBindings;
++} ST_BuiltInResources;
++
++// Flat, heap-owned mirror of sh::ShaderVariable. Created by STCopyVariable, released by
++// STDestroyVariable. `pFields`/`pArraySizes` are owned by this instance and freed recursively.
++typedef struct ST_ShaderVariable {
++    GLenum type;
++    GLenum precision;
++    char* name;
++    int location;
++    bool staticUse;
++    bool isRowMajorLayout;
++
++    uint32_t arraySizeCount;
++    unsigned int* pArraySizes;
++
++    uint32_t fieldsCount;
++    struct ST_ShaderVariable* pFields;
++} ST_ShaderVariable;
++
++// Flat, heap-owned mirror of sh::InterfaceBlock. Created by STCopyInterfaceBlock, released by
++// STDestroyInterfaceBlock.
++typedef struct ST_InterfaceBlock {
++    char* name;
++    int layout;
++    bool isRowMajorLayout;
++    int binding;
++
++    uint32_t fieldsCount;
++    ST_ShaderVariable* pFields;
++} ST_InterfaceBlock;
++
++typedef struct ST_NameHashingMap {
++    uint32_t entryCount;
++    const char** ppUserNames;
++    const char** ppCompiledNames;
++} ST_NameHashingMap;
++
++typedef struct ST_ShaderCompileInfo {
++    ST_Handle handle;
++    GLenum shaderType;
++    ST_ShaderSpec spec;
++    ST_ShaderOutput output;
++    uint32_t compileOptions;
++    ST_BuiltInResources* resources;
++    const char* shaderSource;
++} ST_ShaderCompileInfo;
++
++// Owned by the dylib; released via STFreeShaderResolveState. infoLog/translatedSource and all
++// pointee arrays are valid until that call.
++typedef struct ST_ShaderCompileResult {
++    ST_Handle outputHandle;
++    char* infoLog;
++    char* translatedSource;
++    int compileStatus;
++
++    ST_NameHashingMap* nameHashingMap;
++
++    uint32_t uniformsCount;
++    ST_ShaderVariable* pUniforms;
++    uint32_t inputVaryingsCount;
++    ST_ShaderVariable* pInputVaryings;
++    uint32_t outputVaryingsCount;
++    ST_ShaderVariable* pOutputVaryings;
++    uint32_t allAttributesCount;
++    ST_ShaderVariable* pAllAttributes;
++    uint32_t activeOutputVariablesCount;
++    ST_ShaderVariable* pActiveOutputVariables;
++    uint32_t uniformBlocksCount;
++    ST_InterfaceBlock* pUniformBlocks;
++} ST_ShaderCompileResult;
++
++// Exported symbols, resolved via dlsym/findSymbol by angle_shader_parser.cpp. Signatures must
++// match the *_t typedefs below exactly.
++bool STInitialize(void);
++bool STFinalize(void);
++void STGenerateResources(ST_BuiltInResources* outResources);
++void STCompileAndResolve(const ST_ShaderCompileInfo* info, ST_ShaderCompileResult** outResult);
++void STFreeShaderResolveState(ST_ShaderCompileResult* result);
++ST_ShaderVariable STCopyVariable(const ST_ShaderVariable* var);
++ST_InterfaceBlock STCopyInterfaceBlock(const ST_InterfaceBlock* block);
++void STDestroyVariable(ST_ShaderVariable* var);
++void STDestroyInterfaceBlock(ST_InterfaceBlock* block);
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++typedef bool (*STInitialize_t)(void);
++typedef bool (*STFinalize_t)(void);
++typedef void (*STGenerateResources_t)(ST_BuiltInResources*);
++typedef void (*STCompileAndResolve_t)(const ST_ShaderCompileInfo*, ST_ShaderCompileResult**);
++typedef void (*STFreeShaderResolveState_t)(ST_ShaderCompileResult*);
++typedef ST_ShaderVariable (*STCopyVariable_t)(const ST_ShaderVariable*);
++typedef ST_InterfaceBlock (*STCopyInterfaceBlock_t)(const ST_InterfaceBlock*);
++typedef void (*STDestroyVariable_t)(ST_ShaderVariable*);
++typedef void (*STDestroyInterfaceBlock_t)(ST_InterfaceBlock*);
++
++typedef struct STDispatch {
++    STInitialize_t initialize;
++    STFinalize_t finalize;
++    STGenerateResources_t generateResources;
++    STCompileAndResolve_t compileAndResolve;
++    STFreeShaderResolveState_t freeShaderResolveState;
++    STCopyVariable_t copyVariable;
++    STCopyInterfaceBlock_t copyInterfaceBlock;
++    STDestroyVariable_t destroyVariable;
++    STDestroyInterfaceBlock_t destroyInterfaceBlock;
++} STDispatch;
+diff --git a/host/gl/glestranslator/gles_v2/meson.build b/host/gl/glestranslator/gles_v2/meson.build
+index 3d6079701..5b4be6d52 100644
+--- a/host/gl/glestranslator/gles_v2/meson.build
++++ b/host/gl/glestranslator/gles_v2/meson.build
+@@ -24,6 +24,7 @@ lib_glesv2_translator = static_library(
+     inc_gl_common,
+     inc_gl_openglesdispatch,
+     inc_host_common,
++    inc_host_library,
+     inc_host_decoder_common,
+     inc_common_logging,
+     inc_host_snapshot,
+@@ -39,3 +40,33 @@ lib_glesv2_translator = static_library(
+     lib_host_snapshot,
+   ],
+ )
++
++# ANGLE's shader translator is only specified as a Bazel target (third_party/angle's
++# BUILD.angle.bazel) and gfxstream itself builds with Meson, so the translator + the ST_* C-ABI
++# shim (ShaderTranslator.{h,cpp}, wrapping ANGLE's sh::* API) are built separately with Bazel and
++# the resulting libshadertranslator.{dylib,so,dll} is dlopen()ed at runtime by
++# angle_shader_parser.cpp -- it is never linked into the gfxstream binary itself. Dropped next to
++# libgfxstream_backend so it's on the same DYLD_LIBRARY_PATH/LD_LIBRARY_PATH entry (see
++# scripts/run-capy.sh).
++if use_gles
++  if host_machine.system() == 'darwin'
++    shadertranslator_dylib_name = 'libshadertranslator.dylib'
++  elif host_machine.system() == 'windows'
++    shadertranslator_dylib_name = 'shadertranslator.dll'
++  else
++    shadertranslator_dylib_name = 'libshadertranslator.so'
++  endif
++  custom_target('shadertranslator_dylib',
++    output: 'shadertranslator_dylib.stamp',
++    command: [
++      find_program('bash'), '-c',
++      'cd "' + meson.project_source_root() + '" && ' +
++      'if command -v bazelisk >/dev/null 2>&1; then BAZEL=bazelisk; else BAZEL=bazel; fi && ' +
++      '"$BAZEL" build //host/gl/glestranslator/gles_v2:shadertranslator && ' +
++      'cp -f "bazel-bin/host/gl/glestranslator/gles_v2/' + shadertranslator_dylib_name + '" "' +
++      meson.global_build_root() + '/host/' + shadertranslator_dylib_name + '" && ' +
++      'touch @OUTPUT@',
++    ],
++    build_by_default: true,
++  )
++endif
+diff --git a/meson.build b/meson.build
+index 033bad490..7278af3f2 100644
+--- a/meson.build
++++ b/meson.build
+@@ -109,6 +109,9 @@ endif
+ gfxstream_host_args += '-DGLM_ENABLE_EXPERIMENTAL=1'
+ gfxstream_host_args += '-DGFXSTREAM_MESON_BUILD=1'
+ gfxstream_host_args += '-DGFXSTREAM_ENABLE_HOST_GLES=@0@'.format(use_gles ? '1' : '0')
++if use_gles
++  gfxstream_host_args += '-DUSE_ANGLE_SHADER_PARSER=1'
++endif
+ gfxstream_host_args += '-DVK_BASE_VERSION_1_0'
+ gfxstream_host_args += '-DVK_BASE_VERSION_1_1'
+ gfxstream_host_args += '-DVK_BASE_VERSION_1_2'
+-- 
+2.53.0
+
