@@ -9,8 +9,9 @@ Android rodando nativamente em Apple Silicon macOS via HVF, `libkrun` e `gfxstre
 - ✅ fechar o bloqueio atual do `gfxstream` no host
 - ✅ resolver o bloqueio de compile de shader do decoder GLES (validado por boot real)
 - ✅ SurfaceFlinger/composer3 estáveis ponta a ponta (`use_gles(true)` + `gralloc=minigbm`)
-- resolver os bloqueadores remanescentes de `system_server` (`oemlock` parcialmente, `frp`/
-  `PersistentDataBlockService` em aberto) até `sys.boot_completed=1`
+- ✅ resolver o hang do blit GLES no macOS (Core profile; o bloqueador "composer/GLES" multi-sessão)
+- resolver a data race do deferred `TransferFromHost3d` (último bloqueador conhecido até
+  `sys.boot_completed=1`); `oemlock`/`frp` contornados via workaround
 - garantir boot completo com scrcpy funcional
 - consolidar o fluxo de imagem, kernel e rootfs em scripts únicos
 - tornar o APK instalável e executável como `.app`
@@ -62,9 +63,19 @@ que aparecem durante o boot — cada um só fica visível depois que o anterior 
    silêncio**, travando pra sempre o `dma_fence_default_wait` do `RanchuHwc` (e por consequência o
    `presentDisplay`/`SurfaceFlinger`/`DisplayManagerService`). **Corrigido e commitado**: tratar
    "não encontrado" como "já sinalizado" em vez de dropar o callback.
-4. Com (1)-(3) corrigidos: `SurfaceFlinger` chega a compor frames de verdade, mas ainda existe
-   instabilidade recorrente no ciclo de composite — `DisplayManagerService.<init>()` já foi
-   observado travando 65s numa chamada nativa *diferente* (`getCompositionColorSpaces` →
-   `nativeGetCompositionDataspaces`) que também faz round-trip síncrono pro `SurfaceFlinger`. Pode
-   ser uma variante intermitente da mesma família de race do (3), ou um bug distinto no mesmo
-   caminho. **Não investigado a fundo ainda** — próximo passo.
+4. Com (1)-(3) corrigidos, o `DisplayManagerService.<init>()` travava 65s em
+   `getCompositionColorSpaces` → `presentDisplay` → `RanchuHwc`. **Causa raiz encontrada e
+   corrigida** (patches/README.md gfxstream 0011): o blit de window-surface do GLES no macOS
+   (`eglBlitFromCurrentReadBufferANDROID`) travava o Metal porque o contexto GL do host era legacy
+   2.1 (Apple não tem profile de compatibilidade 3.x), e os shaders internos do translator usavam
+   `#version 300 es`, que o 2.1 rejeita → programa quebrado → draw trava segurando o lock global do
+   FrameBuffer. Forçar **Core profile** no macOS resolve: shaders compilam (`#version 330 core`), o
+   blit completa, e o boot avança até `rcComposeWithoutPost`/scanout. Esse era o bloqueador
+   "composer/GLES" de várias sessões.
+5. **Último bloqueador conhecido** (exposto só depois do 0011, pois o boot só agora chega a renderizar
+   sob carga): data race no caminho de **deferred `TransferFromHost3d`** (libkrun patch 0007 +
+   gfxstream `VirtioGpuResource::TransferWithIov`). A thread deferida que faz o read de resposta do
+   pipe e a main thread que faz o `TransferToHost` do próximo comando tocam o **mesmo resource de
+   pipe** concorrentemente → `iov_base` corrompido → `SIGSEGV` no `memmove` (host crasha ~t=7.5s,
+   logo após compose/scanout começarem). Precisa de serialização por-resource sem reintroduzir o
+   deadlock que o 0007 evitou. **Não corrigido ainda** — ver memória `capivara-compose-loop-blocker`.
