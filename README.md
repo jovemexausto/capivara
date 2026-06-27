@@ -10,8 +10,9 @@ Android rodando nativamente em Apple Silicon macOS via HVF, `libkrun` e `gfxstre
 - ✅ resolver o bloqueio de compile de shader do decoder GLES (validado por boot real)
 - ✅ SurfaceFlinger/composer3 estáveis ponta a ponta (`use_gles(true)` + `gralloc=minigbm`)
 - ✅ resolver o hang do blit GLES no macOS (Core profile; o bloqueador "composer/GLES" multi-sessão)
-- resolver a data race do deferred `TransferFromHost3d` (último bloqueador conhecido até
-  `sys.boot_completed=1`); `oemlock`/`frp` contornados via workaround
+- ✅ resolver o `postOnlyOnMainThread` sem UI thread (descartava toda composição em silêncio)
+- mitigar (não eliminado ainda) a race do deferred `TransferFromHost3d` vs. dispatch thread —
+  último bloqueador conhecido até `sys.boot_completed=1`; `oemlock`/`frp` contornados via workaround
 - garantir boot completo com scrcpy funcional
 - consolidar o fluxo de imagem, kernel e rootfs em scripts únicos
 - tornar o APK instalável e executável como `.app`
@@ -72,10 +73,19 @@ que aparecem durante o boot — cada um só fica visível depois que o anterior 
    FrameBuffer. Forçar **Core profile** no macOS resolve: shaders compilam (`#version 330 core`), o
    blit completa, e o boot avança até `rcComposeWithoutPost`/scanout. Esse era o bloqueador
    "composer/GLES" de várias sessões.
-5. **Último bloqueador conhecido** (exposto só depois do 0011, pois o boot só agora chega a renderizar
-   sob carga): data race no caminho de **deferred `TransferFromHost3d`** (libkrun patch 0007 +
-   gfxstream `VirtioGpuResource::TransferWithIov`). A thread deferida que faz o read de resposta do
-   pipe e a main thread que faz o `TransferToHost` do próximo comando tocam o **mesmo resource de
-   pipe** concorrentemente → `iov_base` corrompido → `SIGSEGV` no `memmove` (host crasha ~t=7.5s,
-   logo após compose/scanout começarem). Precisa de serialização por-resource sem reintroduzir o
-   deadlock que o 0007 evitou. **Não corrigido ainda** — ver memória `capivara-compose-loop-blocker`.
+5. Com (1)-(4) corrigidos, `rcComposeWithoutPost` entrava mas **nunca retornava**:
+   `postOnlyOnMainThread()` (patches/README.md gfxstream 0012) herdava do AEMU a suposição de uma UI
+   thread Cocoa/Qt real pra rodar `PostCmd::Compose` — o Capivara não tem essa UI thread, então
+   `run_on_ui_thread` sempre caía no stub padrão que **descarta a tarefa em silêncio**. `compose()`
+   ficava travado pra sempre em `completeFuture.wait()`. **Corrigido**: roda sempre na própria thread
+   do `PostWorker`. Validado: `rcComposeWithoutPost` passou a entrar E retornar.
+6. **Último bloqueador conhecido, mitigado mas não eliminado**: data race no caminho de **deferred
+   `TransferFromHost3d`** (libkrun patch 0007 + gfxstream `VirtioGpuResource::TransferWithIov`/
+   `VirtioGpuFrontend::mResources`). A thread deferida que lê a resposta do pipe roda sem lock
+   (de propósito, pra não travar a dispatch thread) mas toca o mesmo `std::unordered_map` que
+   comandos inline (ex. `ResourceFlush`) tocam com lock — `SIGSEGV` em `memmove` por `iov_base`
+   corrompido, host crasha entre ~7s e ~580s dependendo da sorte do scheduler. **Mitigado** (libkrun
+   0010: `deferred_guard` serializa leituras do mesmo resource e faz todo comando exceto
+   `TransferToHost3d` esperar leituras em voo esgotarem) mas a causa raiz exata não foi 100%
+   fechada — reduz drasticamente a frequência sem eliminar. Ver memória
+   `capivara-compose-loop-blocker` pro estado exato e hipóteses não confirmadas.

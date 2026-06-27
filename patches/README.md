@@ -10,7 +10,7 @@ numbered `git format-patch` series — so nothing depends on the `/tmp` clone su
 apply cleanly with `git am patches/<repo>/*.patch` against the respective fork's `main`, and both have
 been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the fork clones.
 
-## libkrun — `capivara/macos-gfxstream-vulkan` (9 commits)
+## libkrun — `capivara/macos-gfxstream-vulkan` (10 commits)
 
 | # | Commit | What | Why it's there |
 |---|---|---|---|
@@ -23,13 +23,14 @@ been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the f
 | 0007 | `virtio/gpu: defer gfxstream TransferFromHost3d to break dispatcher deadlock` | One-shot helper thread defers blocking `TransferFromHost3d` reads off the single in-order dispatcher thread. | Fixes the dispatcher deadlock that blocked full Android boot. |
 | 0008 | `virtio/gpu: document that the GLES shader-compile blocker is now fixed` | Comment-only update in `create_rutabaga_gfxstream`'s `use_gles(false)` rationale, pointing at the real fix (gfxstream 0006-0008) instead of the disproven ANGLE-over-Metal hypothesis. `use_gles` still defaults to `false` pending a real Android-guest boot test (only tested against a minimal `/bin/sh` root so far, via a temporary diagnostic edit, reverted). | Keeps the comment from misleading whoever reads it next. |
 | 0009 | `virtio/gpu: flip use_gles(true) to the validated default` | Flips `set_use_gles(false)` to `true`, rewrites the rationale comment. | A real Android guest boot (composer3/RanchuHwc + SurfaceFlinger, plus `crates/capy`'s `gralloc=minigbm`) confirmed `render_control.cpp`/`renderControl_dec` only compile into `libgfxstream_backend` when `use_gles` is on — a Vulkan-only build leaves RanchuHwc's legacy `pipe:opengles` host-extension query unanswered forever, hanging composer until the Watchdog kills `system_server`. SurfaceFlinger ran stable for 800s+ with this on. |
+| 0010 | `virtio/gpu: mitigate deferred TransferFromHost3d vs. dispatch-thread races` | Adds a `deferred_guard` module tracking in-flight deferred reads by resource id; `wait_idle(resource_id)` serializes same-resource deferred reads; `wait_idle_all()` makes every command except `TransferToHost3d` wait for all in-flight deferred reads to drain. | Real, observed `SIGSEGV` in `VirtioGpuResource::TransferWithIov` from two distinct races around the deferred `TransferFromHost3d` thread (0007): same-resource reads running concurrently, and any dispatch-thread command racing a deferred read's lock-free `mResources` lookup. **Not fully closed** — significantly reduces but does not reliably eliminate the crash (one boot ran 580s+ clean, another crashed at ~7s on the identical build). Residual race not yet root-caused; see commit message and `capivara-compose-loop-blocker` memory. |
 
 **Validated**: `cargo check` clean for `libkrun`, `krun-vmm`, `krun-arch`, `krun-kernel`, `krun-smbios`,
 `krun-devices --features gpu-gfxstream`, and `krun-rutabaga-gfx --features gfxstream`. The only failure
 anywhere in the tree is `krun-init-blob`'s build script (musl cross-link, macOS host linker) — confirmed
 pre-existing on fork `main` with zero patches applied.
 
-## gfxstream — `capivara/macos-gfxstream-build` (11 commits)
+## gfxstream — `capivara/macos-gfxstream-build` (12 commits)
 
 Built from fork `main`, starting with the 2 commits that were the old, narrower `capivara/macos-shm-fix`
 PR branch (kept — they're real and unrelated to the rest), then 3 new commits hand-extracted this pass:
@@ -47,6 +48,7 @@ PR branch (kept — they're real and unrelated to the rest), then 3 new commits 
 | 0009 | `host: close the ASG host/guest lost-wakeup race in RingStream::readRaw` | After publishing `ASG_HOST_STATE_NEED_NOTIFY`, issues a `StoreLoad` barrier and re-checks both rings before blocking on `onUnavailableRead()`. | Real race: the guest only pings when it observes `host_state == NEED_NOTIFY`; if it wrote a request and sampled `host_state` while still `CAN_CONSUME` (just before this store), it never pings, and the host's blocking receive sleeps forever on data already in the ring. Caused intermittent ~16s stalls on SurfaceFlinger/HWC's first host round-trip, tripping the Watchdog. Also ignores meson `*.stamp` build artifacts. |
 | 0010 | `host: invoke the completion callback when an export-sync fence isn't found` | `FrameBuffer::Impl::asyncWaitForGpuWithCb` now calls `cb()` before returning when `EmulatedEglFenceSync::getFromHandle` misses, instead of just logging and dropping it. | Same bug shape as 0009, different channel: `destroyWhenSignaled=true` fences self-remove from the registry as soon as they signal (via the render-control/pipe channel), but `GFXSTREAM_CREATE_EXPORT_SYNC` (a separate virtio-gpu command channel, no ordering guarantee) can arrive after that — "not found" then means "already done", not an error. The dropped callback left RanchuHwc's virtio-gpu timeline task (and the guest's `dma_fence_default_wait` backing a `presentDisplay` call) blocked forever. Confirmed live: a single "fence sync 0x... not found" log line at the exact moment `RanchuHwc`'s binder thread hung in `DrmVirtGpuResource::wait()`. |
 | 0011 | `host/gl: force Core profile on macOS so >2.1 GLES contexts/shaders work` | `shouldEnableCoreProfile()` returns `dispatchMaj > 2` on `__APPLE__` instead of gating on `renderer == SELECTED_RENDERER_HOST` (false on macOS). | **The actual fix for the multi-session "composer/GLES" macOS boot hang.** Apple has no GL 3.x compatibility profile, so without Core every host context was legacy 2.1; the translator's internal blit/texture_draw shaders emit `#version 300 es` when `!isCoreProfile()`, which 2.1 rejects, leaving a broken program whose draw (via `eglBlitFromCurrentReadBufferANDROID` during `rcFlushWindowColorBuffer`) hung the Metal command stream while holding the global FrameBuffer lock — freezing the whole renderer and blocking `sys.boot_completed`. Root-caused by bisecting the hang down to `eglBlitFromCurrentReadBufferANDROID` with temporary instrumentation, then to `shouldEnableCoreProfile()` returning false (`renderer=8`, not HOST). Forcing Core makes EGL create a 3.2+/4.1 Core context (`egl_os_api_darwin` already supports it) and the shaders emit `#version 330 core`. |
+| 0012 | `host: never route PostWorker tasks through the (nonexistent) UI thread` | `postOnlyOnMainThread()` returns `false` unconditionally instead of `true` on `__APPLE__`. | Inherited from upstream AEMU, which has a real Cocoa/Qt UI thread `PostWorker::runTask` can post compose tasks onto. Capivara has none — `get_gfxstream_window_operations().run_on_ui_thread` is always the default no-op stub (nothing ever calls `set_gfxstream_window_operations()`), so every `PostCmd::Compose` task was silently discarded forever, and `FrameBuffer::compose()`'s `completeFuture.wait()` blocked indefinitely. This is the real root cause of the multi-session composer/`SurfaceFlinger` boot hang: `RanchuHwc`'s `presentDisplay` (and everything downstream, e.g. `DisplayManagerService`) was waiting on a composited frame that could never arrive. |
 **Validated**: `meson setup -Ddecoders=vulkan --buildtype=debug && ninja` clean after 0003; `meson setup
 -Ddecoders=vulkan,gles,composer --buildtype=debug && ninja` clean after 0004 and 0005, run directly inside
 the fork clone after each commit. 0006/0007: full `decoders=vulkan,gles,composer` meson+ninja build clean
@@ -64,13 +66,15 @@ previously caused intermittent ~16s stalls.
 longer (~700s vs. the prior ~65s Watchdog-kill ceiling) before hitting an unrelated, further-along
 blocker (`getCompositionColorSpaces`, which turned out to be the GLES blit hang that 0011 fixes).
 **0011: validated by a real boot** — the `version '300' is not supported` shader-compile failures
-disappear, `eglBlitFromCurrentReadBufferANDROID` completes instead of hanging, and the boot proceeds
-through `rcComposeWithoutPost` (compose now dispatches) and scanout configuration. It then exposes
-a separate, pre-existing concurrency bug in the deferred-`TransferFromHost3d` path (the host crashes
-with a `SIGSEGV` in `VirtioGpuResource::TransferWithIov` -> `memmove` on a corrupt iovec base — a
-data race between the deferred read thread and the main dispatch thread on the same pipe resource).
-That race, not the GLES hang, is now the remaining blocker to `sys.boot_completed` — see the
-`capivara-compose-loop-blocker` memory note.
+disappear, `eglBlitFromCurrentReadBufferANDROID` completes instead of hanging, and the boot reaches
+`rcComposeWithoutPost`. It then exposed what first looked like a deferred-`TransferFromHost3d` race,
+but instrumentation (composeImpl never entered, `PostWorker::runTask`'s `mainThreadPostingOnly=1`
+branch always taken) traced it to a different bug entirely: 0012.
+**0012: validated by a real boot** — `rcComposeWithoutPost` now both enters *and returns* (previously
+entered once, then hung in `completeFuture.wait()` forever, confirmed via instrumentation). This is
+what finally exposed the *real* deferred-`TransferFromHost3d` vs. dispatch-thread race (libkrun 0010)
+as the actual remaining blocker to `sys.boot_completed` — not fully closed yet, see libkrun 0010's
+entry and the `capivara-compose-loop-blocker` memory note.
 
 0001-0005 carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
 2 pre-existing ones, at the repo owner's explicit instruction. 0006-0008 don't have that trailer yet —
