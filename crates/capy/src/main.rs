@@ -245,13 +245,45 @@ fn proxy_adb_connection(tcp: TcpStream, unix: UnixStream) {
 
 const HEADLESS_FRAME_BUF_SIZE: usize = 3840 * 2160 * 4;
 
+struct DumpCfg {
+    dir: String,
+    every: u64,
+    count: u64,
+}
+
 struct HeadlessDisplay {
     frame_buf: Vec<u8>,
+    // Latest scanout geometry, set by configure_scanout; needed to slice the
+    // composed frame out of frame_buf when dumping.
+    width: u32,
+    height: u32,
+    // Diagnostic frame dump: set CAPY_DUMP_DIR=/path to write raw RGBA scanout
+    // frames (frame-NNN.raw + a one-line frame-NNN.txt with WxH). Lets us answer
+    // "does the headless scanout receive real pixels?" without screencap/codec.
+    dump: Option<DumpCfg>,
+    present_n: u64,
+    dumped_n: u64,
 }
 impl HeadlessDisplay {
     fn new() -> Self {
+        let dump = std::env::var("CAPY_DUMP_DIR").ok().map(|dir| DumpCfg {
+            dir,
+            every: std::env::var("CAPY_DUMP_EVERY")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(15),
+            count: std::env::var("CAPY_DUMP_COUNT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(20),
+        });
         Self {
             frame_buf: vec![0u8; HEADLESS_FRAME_BUF_SIZE],
+            width: 0,
+            height: 0,
+            dump,
+            present_n: 0,
+            dumped_n: 0,
         }
     }
 }
@@ -270,7 +302,7 @@ unsafe extern "C" fn headless_disable_scanout(_: *mut c_void, id: u32) -> i32 {
     0
 }
 unsafe extern "C" fn headless_configure_scanout(
-    _: *mut c_void,
+    instance: *mut c_void,
     id: u32,
     _dw: u32,
     _dh: u32,
@@ -278,6 +310,11 @@ unsafe extern "C" fn headless_configure_scanout(
     h: u32,
     _fmt: u32,
 ) -> i32 {
+    if !instance.is_null() {
+        let disp = &mut *(instance as *mut HeadlessDisplay);
+        disp.width = w;
+        disp.height = h;
+    }
     info!("display: configure scanout {id} {w}x{h}");
     0
 }
@@ -293,12 +330,61 @@ unsafe extern "C" fn headless_alloc_frame(
     0
 }
 unsafe extern "C" fn headless_present_frame(
-    _: *mut c_void,
+    instance: *mut c_void,
     _: u32,
     _: u32,
     _: *const krun_rect,
 ) -> i32 {
-    0 // descarta — SP-4 vai aqui fazer encode para scrcpy
+    // descarta — SP-4 vai aqui fazer encode para scrcpy.
+    // Diagnóstico opcional (CAPY_DUMP_DIR): grava o scanout composto cru pra
+    // provar se o frame_buf recebe pixels reais.
+    if instance.is_null() {
+        return 0;
+    }
+    let disp = &mut *(instance as *mut HeadlessDisplay);
+    disp.present_n += 1;
+    let Some(cfg) = disp.dump.as_ref() else {
+        return 0;
+    };
+    if disp.dumped_n >= cfg.count || disp.present_n % cfg.every != 0 {
+        return 0;
+    }
+    let (w, h) = (disp.width as usize, disp.height as usize);
+    let needed = w.saturating_mul(h).saturating_mul(4);
+    if w == 0 || h == 0 || needed > disp.frame_buf.len() {
+        return 0;
+    }
+    let idx = disp.dumped_n;
+    let dir = cfg.dir.clone();
+    // Resumo rápido de conteúdo: # de pixels com algum canal RGB != 0 e alpha != 0,
+    // amostrando, pra logar imediatamente se há conteúdo (sem esperar análise no host).
+    let buf = &disp.frame_buf[..needed];
+    let (mut rgb_nz, mut a_nz, mut sampled) = (0u32, 0u32, 0u32);
+    let mut i = 0usize;
+    while i < needed {
+        let (r, g, b, a) = (buf[i], buf[i + 1], buf[i + 2], buf[i + 3]);
+        if r != 0 || g != 0 || b != 0 {
+            rgb_nz += 1;
+        }
+        if a != 0 {
+            a_nz += 1;
+        }
+        sampled += 1;
+        i += 4 * 997; // passo primo pra varrer a imagem toda
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    let raw_path = format!("{dir}/frame-{idx:03}.raw");
+    let ok = std::fs::write(&raw_path, buf).is_ok();
+    let _ = std::fs::write(
+        format!("{dir}/frame-{idx:03}.txt"),
+        format!("{w}x{h} rgba8888 rgb_nonzero={rgb_nz}/{sampled} alpha_nonzero={a_nz}/{sampled}\n"),
+    );
+    info!(
+        "display: dumped frame {idx} {w}x{h} rgb_nonzero={rgb_nz}/{sampled} alpha_nonzero={a_nz}/{sampled} ({})",
+        if ok { &raw_path } else { "write failed" }
+    );
+    disp.dumped_n += 1;
+    0
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
