@@ -78,12 +78,38 @@ else
 fi
 
 # ── 3. merge do fragmento de Kconfig ────────────────────────────────────────────────────────────
+# merge_config -m só faz merge TEXTUAL: anexa as linhas do fragmento no fim do
+# gki_defconfig. Isso deixa o defconfig em forma NÃO-canônica (símbolos fora de
+# ordem, comentários, redundâncias). O Kleaf, no kernel_aarch64_config, roda
+# `savedefconfig` e exige que o gki_defconfig commitado JÁ esteja na forma minimal
+# que o savedefconfig produz — senão falha com
+# "savedefconfig does not match common/arch/arm64/configs/gki_defconfig".
 DEFCONFIG="$KERNEL_COMMON/arch/arm64/configs/gki_defconfig"
 KCONFIG_CONFIG="$DEFCONFIG" "$KERNEL_COMMON/scripts/kconfig/merge_config.sh" -m \
   "$DEFCONFIG" "$CONFIG_FRAGMENT"
 
-# ── 4. build via Bazel/Kleaf ────────────────────────────────────────────────────────────────────
+# ── 3.5 normaliza o gki_defconfig via savedefconfig do próprio Kleaf ──────────────────────────────
+# Regenera o gki_defconfig na forma canônica (resolve a ordem/minimalização que o
+# check do kernel_aarch64_config exige). Lê o defconfig mergeado acima, deriva o
+# .config e escreve o savedefconfig de volta no source tree, in-place.
 cd "$KERNEL_DIR"
+./tools/bazel run --config=local --lto=none //common:kernel_aarch64_savedefconfig
+
+# Guard: o savedefconfig só mantém símbolos não-default. Se algum dos nossos não
+# sobreviveu (dependência não satisfeita, símbolo renomeado, etc.), o build dist
+# seguiria sem ele e o boot/codec regrediria silenciosamente — falha aqui.
+for sym in \
+  CONFIG_VIRTIO_MMIO=y CONFIG_TCG_VIRTIO=y CONFIG_DRM_VIRTIO_GPU=y \
+  CONFIG_DMABUF_HEAPS=y CONFIG_DMABUF_HEAPS_SYSTEM=y; do
+  if ! grep -qx "$sym" "$DEFCONFIG"; then
+    echo "✗ $sym sumiu do gki_defconfig após savedefconfig — dependência não satisfeita?" >&2
+    echo "  defconfig atual:"; grep -iE "DMABUF|VIRTIO_MMIO|TCG_VIRTIO|VIRTIO_GPU" "$DEFCONFIG" >&2 || true
+    exit 1
+  fi
+done
+echo "✓ gki_defconfig normalizado; símbolos do Capivara presentes"
+
+# ── 4. build via Bazel/Kleaf ────────────────────────────────────────────────────────────────────
 ./tools/bazel run --config=local --lto=none //common:kernel_aarch64_dist -- --destdir="$KERNEL_DIST_DIR/kernel"
 
 # ── 5. coleta e verifica os artefatos ───────────────────────────────────────────────────────────
