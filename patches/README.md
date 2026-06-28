@@ -30,7 +30,7 @@ been fully `cargo check`/`meson`+`ninja`-validated commit by commit inside the f
 anywhere in the tree is `krun-init-blob`'s build script (musl cross-link, macOS host linker) — confirmed
 pre-existing on fork `main` with zero patches applied.
 
-## gfxstream — `capivara/macos-gfxstream-build` (12 commits)
+## gfxstream — `capivara/macos-gfxstream-build` (13 commits)
 
 Built from fork `main`, starting with the 2 commits that were the old, narrower `capivara/macos-shm-fix`
 PR branch (kept — they're real and unrelated to the rest), then 3 new commits hand-extracted this pass:
@@ -49,6 +49,7 @@ PR branch (kept — they're real and unrelated to the rest), then 3 new commits 
 | 0010 | `host: invoke the completion callback when an export-sync fence isn't found` | `FrameBuffer::Impl::asyncWaitForGpuWithCb` now calls `cb()` before returning when `EmulatedEglFenceSync::getFromHandle` misses, instead of just logging and dropping it. | Same bug shape as 0009, different channel: `destroyWhenSignaled=true` fences self-remove from the registry as soon as they signal (via the render-control/pipe channel), but `GFXSTREAM_CREATE_EXPORT_SYNC` (a separate virtio-gpu command channel, no ordering guarantee) can arrive after that — "not found" then means "already done", not an error. The dropped callback left RanchuHwc's virtio-gpu timeline task (and the guest's `dma_fence_default_wait` backing a `presentDisplay` call) blocked forever. Confirmed live: a single "fence sync 0x... not found" log line at the exact moment `RanchuHwc`'s binder thread hung in `DrmVirtGpuResource::wait()`. |
 | 0011 | `host/gl: force Core profile on macOS so >2.1 GLES contexts/shaders work` | `shouldEnableCoreProfile()` returns `dispatchMaj > 2` on `__APPLE__` instead of gating on `renderer == SELECTED_RENDERER_HOST` (false on macOS). | **The actual fix for the multi-session "composer/GLES" macOS boot hang.** Apple has no GL 3.x compatibility profile, so without Core every host context was legacy 2.1; the translator's internal blit/texture_draw shaders emit `#version 300 es` when `!isCoreProfile()`, which 2.1 rejects, leaving a broken program whose draw (via `eglBlitFromCurrentReadBufferANDROID` during `rcFlushWindowColorBuffer`) hung the Metal command stream while holding the global FrameBuffer lock — freezing the whole renderer and blocking `sys.boot_completed`. Root-caused by bisecting the hang down to `eglBlitFromCurrentReadBufferANDROID` with temporary instrumentation, then to `shouldEnableCoreProfile()` returning false (`renderer=8`, not HOST). Forcing Core makes EGL create a 3.2+/4.1 Core context (`egl_os_api_darwin` already supports it) and the shaders emit `#version 330 core`. |
 | 0012 | `host: never route PostWorker tasks through the (nonexistent) UI thread` | `postOnlyOnMainThread()` returns `false` unconditionally instead of `true` on `__APPLE__`. | Inherited from upstream AEMU, which has a real Cocoa/Qt UI thread `PostWorker::runTask` can post compose tasks onto. Capivara has none — `get_gfxstream_window_operations().run_on_ui_thread` is always the default no-op stub (nothing ever calls `set_gfxstream_window_operations()`), so every `PostCmd::Compose` task was silently discarded forever, and `FrameBuffer::compose()`'s `completeFuture.wait()` blocked indefinitely. This is the real root cause of the multi-session composer/`SurfaceFlinger` boot hang: `RanchuHwc`'s `presentDisplay` (and everything downstream, e.g. `DisplayManagerService`) was waiting on a composited frame that could never arrive. |
+| 0013 | `host: store VirtioGpuFrontend::mResources as shared_ptr, guard map ops with a mutex` | `mResources` maps to `shared_ptr<VirtioGpuResource>` now; a new `mResourcesMutex` guards only the map operation itself (find/insert/erase), never any blocking I/O. | `mResources` is reached from the dispatch thread, a deferred `TransferFromHost3d` reader thread (deliberately lock-free by design, see libkrun 0010), and potentially gfxstream's own `SyncThread` worker-pool threads running fence/compose completion callbacks — none of those shared a lock before. A `VirtioGpuResource` stored by value could be erased/move-assigned out from under an in-flight reader. Real, independently-justified structural fix for a genuine class of bug (map-level use-after-free) — **not confirmed sufficient on its own**: the exact same `SIGSEGV` in `TransferWithIov`, with byte-identical corrupted memory, reproduced again after this change. See libkrun 0010's entry and the `capivara-compose-loop-blocker` memory note. |
 **Validated**: `meson setup -Ddecoders=vulkan --buildtype=debug && ninja` clean after 0003; `meson setup
 -Ddecoders=vulkan,gles,composer --buildtype=debug && ninja` clean after 0004 and 0005, run directly inside
 the fork clone after each commit. 0006/0007: full `decoders=vulkan,gles,composer` meson+ninja build clean
@@ -72,9 +73,15 @@ but instrumentation (composeImpl never entered, `PostWorker::runTask`'s `mainThr
 branch always taken) traced it to a different bug entirely: 0012.
 **0012: validated by a real boot** — `rcComposeWithoutPost` now both enters *and returns* (previously
 entered once, then hung in `completeFuture.wait()` forever, confirmed via instrumentation). This is
-what finally exposed the *real* deferred-`TransferFromHost3d` vs. dispatch-thread race (libkrun 0010)
-as the actual remaining blocker to `sys.boot_completed` — not fully closed yet, see libkrun 0010's
-entry and the `capivara-compose-loop-blocker` memory note.
+what finally exposed a `SIGSEGV` in `TransferWithIov` as the remaining blocker.
+**0013: NOT validated as sufficient** — compiles clean, applies the structurally-correct
+shared_ptr+mutex fix for the map-level race hypothesis, but the identical crash reproduced again
+after rebuilding with it. The corrupted memory decodes to a literal substring of a Capivara string
+constant (`/tmp/capy-adb-5555.sock`), the same byte-for-byte garbage across unrelated sessions —
+inconsistent with a classic data race (which produces varying corruption) and more consistent with
+a deterministic logic bug, e.g. an iovec read before ever being attached. Root cause of *this*
+specific crash remains open; see the `capivara-compose-loop-blocker` memory note for the full trail
+and the next concrete lead (instrument inside `TransferWithIov` itself, right before the `memmove`).
 
 0001-0005 carry the same `Signed-off-by: Marcus Figueiredo <figueiredo@protonmail.com>` trailer as the
 2 pre-existing ones, at the repo owner's explicit instruction. 0006-0008 don't have that trailer yet —

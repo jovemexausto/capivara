@@ -1,0 +1,566 @@
+From f6834ea606e6991fc845517a3642dbed1b84a9e0 Mon Sep 17 00:00:00 2001
+From: Capivara CI <ci@capivara.dev>
+Date: Sat, 27 Jun 2026 20:59:11 -0300
+Subject: [PATCH] host: store VirtioGpuFrontend::mResources as shared_ptr,
+ guard map ops with a mutex
+
+mResources is reached from the dispatch thread (holding the Rust-side
+Arc<Mutex<VirtioGpu>>), a deferred TransferFromHost3d reader thread
+(deliberately NOT holding that lock -- see
+rutabaga_gfx::transfer_read_blocking_by_id), and potentially any of
+gfxstream's own SyncThread worker-pool threads running a fence/compose
+completion callback. None of those call sites share a single lock
+today, so a VirtioGpuResource stored by value could be erased or
+move-assigned out from under an in-flight reader, leaving its
+mIovs/mLinear dangling.
+
+Changes mResources to map to shared_ptr<VirtioGpuResource> and adds
+mResourcesMutex, held only around the map operation itself (find/
+insert/erase), never across any blocking I/O. A caller copies the
+shared_ptr under the lock, releases it immediately, then does its
+(possibly slow) work through that copy -- the resource stays alive
+for as long as any copy of the shared_ptr does, even if another
+thread erases it from the map in the meantime. This is deadlock-free
+by construction: the lock is never held across the long pipe wait
+TransferRead can do, so it can't reintroduce the dispatcher deadlock
+libkrun 0007 exists to avoid.
+
+This is a real, independently-justified structural fix for a genuine
+class of bug (map-level use-after-free), found while investigating the
+SIGSEGV in TransferWithIov tracked since libkrun 0010. It is NOT
+confirmed to be sufficient on its own: the exact same crash, with the
+exact same corrupted bytes, reproduced again after this change (see
+the capivara-compose-loop-blocker memory note). The corrupted address
+decodes to a literal substring of a Capivara-side string constant
+("/tmp/capy-adb-5555.sock"), which doesn't fit a classic cross-thread
+data race (those produce varying garbage, not byte-identical garbage
+across unrelated sessions) -- pointing instead at a deterministic
+logic bug, likely an iovec that's read before ever being properly
+attached. Kept as a real, defensible improvement regardless.
+---
+ host/virtio_gpu_frontend.cpp | 300 ++++++++++++++++++++++-------------
+ host/virtio_gpu_frontend.h   |  25 ++-
+ 2 files changed, 218 insertions(+), 107 deletions(-)
+
+diff --git a/host/virtio_gpu_frontend.cpp b/host/virtio_gpu_frontend.cpp
+index fd656f2b1..c4e9ffb7e 100644
+--- a/host/virtio_gpu_frontend.cpp
++++ b/host/virtio_gpu_frontend.cpp
+@@ -253,15 +253,19 @@ int VirtioGpuFrontend::processAddressSpaceCommand(VirtioGpuCtxId ctxId, const ui
+                 return -EINVAL;
+             }
+ 
+-            auto resourceIt = mResources.find(contextCreate.resourceId);
+-            if (resourceIt == mResources.end()) {
+-                GFXSTREAM_ERROR("ASG coherent resource %u not found", contextCreate.resourceId);
+-                return -EINVAL;
++            std::shared_ptr<VirtioGpuResource> resource;
++            {
++                std::lock_guard<std::mutex> lock(mResourcesMutex);
++                auto resourceIt = mResources.find(contextCreate.resourceId);
++                if (resourceIt == mResources.end()) {
++                    GFXSTREAM_ERROR("ASG coherent resource %u not found", contextCreate.resourceId);
++                    return -EINVAL;
++                }
++                resource = resourceIt->second;
+             }
+-            auto& resource = resourceIt->second;
+ 
+             return context.CreateAddressSpaceGraphicsInstance(get_gfxstream_address_space_ops(),
+-                                                              resource);
++                                                              *resource);
+         }
+         case GFXSTREAM_CONTEXT_PING: {
+             gfxstream::gfxstreamContextPing contextPing = {};
+@@ -507,7 +511,10 @@ int VirtioGpuFrontend::createResource(struct stream_renderer_resource_create_arg
+         GFXSTREAM_ERROR("Failed to create resource %u.", args->handle);
+         return -EINVAL;
+     }
+-    mResources[args->handle] = std::move(*resourceOpt);
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        mResources[args->handle] = std::make_shared<VirtioGpuResource>(std::move(*resourceOpt));
++    }
+     return 0;
+ }
+ 
+@@ -531,58 +538,78 @@ int VirtioGpuFrontend::importResource(uint32_t res_handle,
+         return -EINVAL;
+     }
+ 
+-    auto resourceIt = mResources.find(res_handle);
+-    if (resourceIt == mResources.end()) {
+-        GFXSTREAM_ERROR(
+-            "import_data::flags specified STREAM_RENDERER_IMPORT_FLAG_RESOURCE_EXISTS, but "
+-            "internal resource does not already exist",
+-            res_handle);
+-        return -EINVAL;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(res_handle);
++        if (resourceIt == mResources.end()) {
++            GFXSTREAM_ERROR(
++                "import_data::flags specified STREAM_RENDERER_IMPORT_FLAG_RESOURCE_EXISTS, but "
++                "internal resource does not already exist",
++                res_handle);
++            return -EINVAL;
++        }
++        resource = resourceIt->second;
+     }
+ 
+-    return resourceIt->second.ImportHandle(import_handle, import_data);
++    return resource->ImportHandle(import_handle, import_data);
+ }
+ 
+ void VirtioGpuFrontend::unrefResource(uint32_t resourceId) {
+     D("resource: %u", resourceId);
+ 
+-    auto resourceIt = mResources.find(resourceId);
+-    if (resourceIt == mResources.end()) return;
+-    auto& resource = resourceIt->second;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(resourceId);
++        if (resourceIt == mResources.end()) return;
++        resource = resourceIt->second;
++    }
+ 
+-    auto attachedContextIds = resource.GetAttachedContexts();
++    auto attachedContextIds = resource->GetAttachedContexts();
+     for (auto contextId : attachedContextIds) {
+         detachResource(contextId, resourceId);
+     }
+ 
+-    resource.Destroy();
++    resource->Destroy();
+ 
+-    mResources.erase(resourceIt);
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        mResources.erase(resourceId);
++    }
+ }
+ 
+ int VirtioGpuFrontend::attachIov(int resourceId, struct iovec* iov, int num_iovs) {
+     D("resource:%d numiovs: %d", resourceId, num_iovs);
+ 
+-    auto it = mResources.find(resourceId);
+-    if (it == mResources.end()) {
+-        GFXSTREAM_ERROR("failed to attach iov: resource %u not found.", resourceId);
+-        return ENOENT;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto it = mResources.find(resourceId);
++        if (it == mResources.end()) {
++            GFXSTREAM_ERROR("failed to attach iov: resource %u not found.", resourceId);
++            return ENOENT;
++        }
++        resource = it->second;
+     }
+-    auto& resource = it->second;
+-    resource.AttachIov(iov, num_iovs);
++    resource->AttachIov(iov, num_iovs);
+     return 0;
+ }
+ 
+ void VirtioGpuFrontend::detachIov(int resourceId) {
+     D("resource:%d", resourceId);
+ 
+-    auto it = mResources.find(resourceId);
+-    if (it == mResources.end()) {
+-        GFXSTREAM_ERROR("failed to detach iov: resource %u not found.", resourceId);
+-        return;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto it = mResources.find(resourceId);
++        if (it == mResources.end()) {
++            GFXSTREAM_ERROR("failed to detach iov: resource %u not found.", resourceId);
++            return;
++        }
++        resource = it->second;
+     }
+-    auto& resource = it->second;
+-    resource.DetachIov();
++    resource->DetachIov();
+ }
+ 
+ namespace {
+@@ -603,24 +630,38 @@ std::optional<std::vector<struct iovec>> AsVecOption(struct iovec* iov, int iove
+ 
+ int VirtioGpuFrontend::transferReadIov(int resId, uint64_t offset, stream_renderer_box* box,
+                                        struct iovec* iov, int iovec_cnt) {
+-    auto it = mResources.find(resId);
+-    if (it == mResources.end()) {
+-        GFXSTREAM_ERROR("Failed to transfer: failed to find resource %d.", resId);
+-        return EINVAL;
++    // Take a strong reference under the lock, then release the lock before doing
++    // any work on the resource (TransferRead can block on a pipe RenderThread).
++    // This is the call a deferred TransferFromHost3d reader thread reaches via
++    // rutabaga_gfx::transfer_read_blocking_by_id, deliberately without holding
++    // the Rust-side Arc<Mutex<VirtioGpu>> -- see mResources' doc comment in the
++    // header for why a shared_ptr is required here, not just a short lock.
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto it = mResources.find(resId);
++        if (it == mResources.end()) {
++            GFXSTREAM_ERROR("Failed to transfer: failed to find resource %d.", resId);
++            return EINVAL;
++        }
++        resource = it->second;
+     }
+-    auto& resource = it->second;
+-    return resource.TransferRead(offset, box, AsVecOption(iov, iovec_cnt));
++    return resource->TransferRead(offset, box, AsVecOption(iov, iovec_cnt));
+ }
+ 
+ int VirtioGpuFrontend::transferWriteIov(int resId, uint64_t offset, stream_renderer_box* box,
+                                         struct iovec* iov, int iovec_cnt) {
+-    auto it = mResources.find(resId);
+-    if (it == mResources.end()) {
+-        GFXSTREAM_ERROR("Failed to transfer: failed to find resource %d.", resId);
+-        return EINVAL;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto it = mResources.find(resId);
++        if (it == mResources.end()) {
++            GFXSTREAM_ERROR("Failed to transfer: failed to find resource %d.", resId);
++            return EINVAL;
++        }
++        resource = it->second;
+     }
+-    auto& resource = it->second;
+-    return resource.TransferWrite(offset, box, AsVecOption(iov, iovec_cnt));
++    return resource->TransferWrite(offset, box, AsVecOption(iov, iovec_cnt));
+ }
+ 
+ void VirtioGpuFrontend::getCapset(uint32_t set, uint32_t* max_size) {
+@@ -768,15 +809,19 @@ void VirtioGpuFrontend::attachResource(uint32_t contextId, uint32_t resourceId)
+     }
+     auto& context = contextIt->second;
+ 
+-    auto resourceIt = mResources.find(resourceId);
+-    if (resourceIt == mResources.end()) {
+-        GFXSTREAM_ERROR("failed to attach resource %u to context %u: resource not found.",
+-                        resourceId, contextId);
+-        return;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(resourceId);
++        if (resourceIt == mResources.end()) {
++            GFXSTREAM_ERROR("failed to attach resource %u to context %u: resource not found.",
++                            resourceId, contextId);
++            return;
++        }
++        resource = resourceIt->second;
+     }
+-    auto& resource = resourceIt->second;
+ 
+-    context.AttachResource(resource);
++    context.AttachResource(*resource);
+ }
+ 
+ void VirtioGpuFrontend::detachResource(uint32_t contextId, uint32_t resourceId) {
+@@ -790,23 +835,27 @@ void VirtioGpuFrontend::detachResource(uint32_t contextId, uint32_t resourceId)
+     }
+     auto& context = contextIt->second;
+ 
+-    auto resourceIt = mResources.find(resourceId);
+-    if (resourceIt == mResources.end()) {
+-        GFXSTREAM_ERROR("failed to attach resource %u to context %u: resource not found.",
+-                        resourceId, contextId);
+-        return;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(resourceId);
++        if (resourceIt == mResources.end()) {
++            GFXSTREAM_ERROR("failed to attach resource %u to context %u: resource not found.",
++                            resourceId, contextId);
++            return;
++        }
++        resource = resourceIt->second;
+     }
+-    auto& resource = resourceIt->second;
+ 
+     auto resourceAsgOpt = context.TakeAddressSpaceGraphicsHandle(resourceId);
+     if (resourceAsgOpt) {
+         mCleanupThread->enqueueCleanup(
+-            [asgBlob = resource.ShareRingBlob(), asgHandle = *resourceAsgOpt]() {
++            [asgBlob = resource->ShareRingBlob(), asgHandle = *resourceAsgOpt]() {
+                 get_gfxstream_address_space_ops().destroy_handle(asgHandle);
+             });
+     }
+ 
+-    context.DetachResource(resource);
++    context.DetachResource(*resource);
+ }
+ 
+ int VirtioGpuFrontend::getResourceInfo(uint32_t resourceId,
+@@ -818,13 +867,17 @@ int VirtioGpuFrontend::getResourceInfo(uint32_t resourceId,
+         return EINVAL;
+     }
+ 
+-    auto resourceIt = mResources.find(resourceId);
+-    if (resourceIt == mResources.end()) {
+-        GFXSTREAM_ERROR("Failed to get info: failed to find resource %d.", resourceId);
+-        return ENOENT;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(resourceId);
++        if (resourceIt == mResources.end()) {
++            GFXSTREAM_ERROR("Failed to get info: failed to find resource %d.", resourceId);
++            return ENOENT;
++        }
++        resource = resourceIt->second;
+     }
+-    auto& resource = resourceIt->second;
+-    return resource.GetInfo(info);
++    return resource->GetInfo(info);
+ }
+ 
+ void VirtioGpuFrontend::flushResource(uint32_t res_handle) {
+@@ -859,7 +912,10 @@ int VirtioGpuFrontend::createBlob(uint32_t contextId, uint32_t resourceId,
+         GFXSTREAM_ERROR("failed to create blob resource %u.", resourceId);
+         return -EINVAL;
+     }
+-    mResources[resourceId] = std::move(*resourceOpt);
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        mResources[resourceId] = std::make_shared<VirtioGpuResource>(std::move(*resourceOpt));
++    }
+     return 0;
+ }
+ 
+@@ -871,26 +927,32 @@ int VirtioGpuFrontend::resourceMap(uint32_t resourceId, void** hvaOut, uint64_t*
+         return -EINVAL;
+     }
+ 
+-    auto it = mResources.find(resourceId);
+-    if (it == mResources.end()) {
+-        if (hvaOut) *hvaOut = nullptr;
+-        if (sizeOut) *sizeOut = 0;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto it = mResources.find(resourceId);
++        if (it == mResources.end()) {
++            if (hvaOut) *hvaOut = nullptr;
++            if (sizeOut) *sizeOut = 0;
+ 
+-        GFXSTREAM_ERROR("Failed to map resource: unknown resource id %d.", resourceId);
+-        return -EINVAL;
++            GFXSTREAM_ERROR("Failed to map resource: unknown resource id %d.", resourceId);
++            return -EINVAL;
++        }
++        resource = it->second;
+     }
+-
+-    auto& resource = it->second;
+-    return resource.Map(hvaOut, sizeOut);
++    return resource->Map(hvaOut, sizeOut);
+ }
+ 
+ int VirtioGpuFrontend::resourceUnmap(uint32_t resourceId) {
+     D("resource: %u", resourceId);
+ 
+-    auto it = mResources.find(resourceId);
+-    if (it == mResources.end()) {
+-        GFXSTREAM_ERROR("Failed to map resource: unknown resource id %d.", resourceId);
+-        return -EINVAL;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto it = mResources.find(resourceId);
++        if (it == mResources.end()) {
++            GFXSTREAM_ERROR("Failed to map resource: unknown resource id %d.", resourceId);
++            return -EINVAL;
++        }
+     }
+ 
+     // TODO(lfy): Good place to run any registered cleanup callbacks.
+@@ -917,26 +979,33 @@ int VirtioGpuFrontend::platformDestroySharedEglContext(void* context) {
+ int VirtioGpuFrontend::resourceMapInfo(uint32_t resourceId, uint32_t* map_info) {
+     D("resource: %u", resourceId);
+ 
+-    auto resourceIt = mResources.find(resourceId);
+-    if (resourceIt == mResources.end()) {
+-        GFXSTREAM_ERROR("Failed to get resource map info: unknown resource %d.", resourceId);
+-        return -EINVAL;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(resourceId);
++        if (resourceIt == mResources.end()) {
++            GFXSTREAM_ERROR("Failed to get resource map info: unknown resource %d.", resourceId);
++            return -EINVAL;
++        }
++        resource = resourceIt->second;
+     }
+-
+-    const auto& resource = resourceIt->second;
+-    return resource.GetCaching(map_info);
++    return resource->GetCaching(map_info);
+ }
+ 
+ int VirtioGpuFrontend::exportBlob(uint32_t resourceId, struct stream_renderer_handle* handle) {
+     D("resource: %u", resourceId);
+ 
+-    auto resourceIt = mResources.find(resourceId);
+-    if (resourceIt == mResources.end()) {
+-        GFXSTREAM_ERROR("Failed to export blob: unknown resource %d.", resourceId);
+-        return -EINVAL;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(resourceId);
++        if (resourceIt == mResources.end()) {
++            GFXSTREAM_ERROR("Failed to export blob: unknown resource %d.", resourceId);
++            return -EINVAL;
++        }
++        resource = resourceIt->second;
+     }
+-    auto& resource = resourceIt->second;
+-    return resource.ExportBlob(handle);
++    return resource->ExportBlob(handle);
+ }
+ 
+ int VirtioGpuFrontend::exportFence(uint64_t fenceId, struct stream_renderer_handle* handle) {
+@@ -968,29 +1037,48 @@ int VirtioGpuFrontend::exportFence(uint64_t fenceId, struct stream_renderer_hand
+ 
+ int VirtioGpuFrontend::vulkanInfo(uint32_t resourceId,
+                                   struct stream_renderer_vulkan_info* vulkanInfo) {
+-    auto resourceIt = mResources.find(resourceId);
+-    if (resourceIt == mResources.end()) {
+-        GFXSTREAM_ERROR("failed to get vulkan info: failed to find resource %d", resourceId);
+-        return -EINVAL;
++    std::shared_ptr<VirtioGpuResource> resource;
++    {
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
++        auto resourceIt = mResources.find(resourceId);
++        if (resourceIt == mResources.end()) {
++            GFXSTREAM_ERROR("failed to get vulkan info: failed to find resource %d", resourceId);
++            return -EINVAL;
++        }
++        resource = resourceIt->second;
+     }
+-    auto& resource = resourceIt->second;
+-    return resource.GetVulkanInfo(vulkanInfo);
++    return resource->GetVulkanInfo(vulkanInfo);
+ }
+ 
+ int VirtioGpuFrontend::destroyVirtioGpuObjects() {
+     {
+         std::vector<VirtioGpuResourceId> resourceIds;
+-        resourceIds.reserve(mResources.size());
+-        for (auto& [resourceId, resource] : mResources) {
+-            const auto contextIds = resource.GetAttachedContexts();
++        {
++            std::lock_guard<std::mutex> lock(mResourcesMutex);
++            resourceIds.reserve(mResources.size());
++            for (const auto& [resourceId, resource] : mResources) {
++                resourceIds.push_back(resourceId);
++            }
++        }
++        // detachResource/unrefResource each take mResourcesMutex internally; don't
++        // hold it across these calls.
++        for (const VirtioGpuResourceId resourceId : resourceIds) {
++            std::shared_ptr<VirtioGpuResource> resource;
++            {
++                std::lock_guard<std::mutex> lock(mResourcesMutex);
++                auto it = mResources.find(resourceId);
++                if (it == mResources.end()) continue;
++                resource = it->second;
++            }
++            const auto contextIds = resource->GetAttachedContexts();
+             for (const VirtioGpuContextId contextId : contextIds) {
+                 detachResource(contextId, resourceId);
+             }
+-            resourceIds.push_back(resourceId);
+         }
+         for (const VirtioGpuResourceId resourceId : resourceIds) {
+             unrefResource(resourceId);
+         }
++        std::lock_guard<std::mutex> lock(mResourcesMutex);
+         mResources.clear();
+     }
+     {
+@@ -1083,7 +1171,7 @@ int VirtioGpuFrontend::snapshotFrontend(const char* directory) {
+         (*snapshot.mutable_contexts())[contextId] = std::move(*contextSnapshotOpt);
+     }
+     for (const auto& [resourceId, resource] : mResources) {
+-        auto resourceSnapshotOpt = resource.Snapshot();
++        auto resourceSnapshotOpt = resource->Snapshot();
+         if (!resourceSnapshotOpt) {
+             GFXSTREAM_ERROR("Failed to snapshot resource %d", resourceId);
+             return -1;
+@@ -1215,7 +1303,7 @@ int VirtioGpuFrontend::restoreFrontend(const char* directory) {
+             GFXSTREAM_ERROR("Failed to restore resource %d", resourceId);
+             return -1;
+         }
+-        mResources.emplace(resourceId, std::move(*resourceOpt));
++        mResources.emplace(resourceId, std::make_shared<VirtioGpuResource>(std::move(*resourceOpt)));
+     }
+ 
+     mVirtioGpuTimelines =
+@@ -1251,7 +1339,7 @@ int VirtioGpuFrontend::restoreAsg(const char* directory) {
+             void* mappedAddr = nullptr;
+             uint64_t mappedSize = 0;
+ 
+-            int ret = resource.Map(&mappedAddr, &mappedSize);
++            int ret = resource->Map(&mappedAddr, &mappedSize);
+             if (ret) {
+                 GFXSTREAM_ERROR("Failed to restore ASG device: failed to map resource %" PRIu32,
+                                 resourceId);
+diff --git a/host/virtio_gpu_frontend.h b/host/virtio_gpu_frontend.h
+index 043156071..9450582a9 100644
+--- a/host/virtio_gpu_frontend.h
++++ b/host/virtio_gpu_frontend.h
+@@ -17,6 +17,7 @@
+ #include <stdint.h>
+ 
+ #include <memory>
++#include <mutex>
+ #include <unordered_map>
+ 
+ extern "C" {
+@@ -147,7 +148,29 @@ class VirtioGpuFrontend {
+     //
+     // LINT.IfChange(virtio_gpu_frontend)
+     std::unordered_map<VirtioGpuContextId, VirtioGpuContext> mContexts;
+-    std::unordered_map<VirtioGpuResourceId, VirtioGpuResource> mResources;
++    //
++    // mResources is read from both the dispatch thread (holding the Rust-side
++    // Arc<Mutex<VirtioGpu>>) and a deferred TransferFromHost3d reader thread
++    // (deliberately NOT holding that lock, by design -- see
++    // rutabaga_gfx::transfer_read_blocking_by_id and libkrun
++    // worker.rs/process_queue's comments) -- plus, per gfxstream's own
++    // architecture, any of SyncThread's worker-pool threads that end up
++    // running a fence/compose completion callback. None of those call sites
++    // share a single lock today, so a `VirtioGpuResource` stored by value can
++    // be erased/move-assigned out from under an in-flight reader -> dangling
++    // mIovs/mLinear -> SIGSEGV in TransferWithIov (observed repeatedly; see
++    // patches/README.md libkrun 0010 and the capivara-compose-loop-blocker
++    // memory note for the full diagnostic trail).
++    //
++    // shared_ptr + a short-lived mutex around just the map operations (not
++    // any blocking I/O) fixes this without reintroducing the dispatcher
++    // deadlock libkrun 0007 exists to avoid: a caller copies the shared_ptr
++    // under mResourcesMutex, releases the lock immediately, then does its
++    // (possibly slow) work through that copy -- the resource stays alive for
++    // as long as any copy of the shared_ptr does, even if another thread
++    // erases it from the map in the meantime.
++    mutable std::mutex mResourcesMutex;
++    std::unordered_map<VirtioGpuResourceId, std::shared_ptr<VirtioGpuResource>> mResources;
+     std::unordered_map<uint64_t, std::shared_ptr<SyncDescriptorInfo>> mSyncMap;
+     // When we wait for gpu or wait for gpu vulkan, the next (and subsequent)
+     // fences created for that context should not be signaled immediately.
+-- 
+2.53.0
+

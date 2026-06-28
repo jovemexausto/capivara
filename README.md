@@ -79,13 +79,14 @@ que aparecem durante o boot — cada um só fica visível depois que o anterior 
    `run_on_ui_thread` sempre caía no stub padrão que **descarta a tarefa em silêncio**. `compose()`
    ficava travado pra sempre em `completeFuture.wait()`. **Corrigido**: roda sempre na própria thread
    do `PostWorker`. Validado: `rcComposeWithoutPost` passou a entrar E retornar.
-6. **Último bloqueador conhecido, mitigado mas não eliminado**: data race no caminho de **deferred
-   `TransferFromHost3d`** (libkrun patch 0007 + gfxstream `VirtioGpuResource::TransferWithIov`/
-   `VirtioGpuFrontend::mResources`). A thread deferida que lê a resposta do pipe roda sem lock
-   (de propósito, pra não travar a dispatch thread) mas toca o mesmo `std::unordered_map` que
-   comandos inline (ex. `ResourceFlush`) tocam com lock — `SIGSEGV` em `memmove` por `iov_base`
-   corrompido, host crasha entre ~7s e ~580s dependendo da sorte do scheduler. **Mitigado** (libkrun
-   0010: `deferred_guard` serializa leituras do mesmo resource e faz todo comando exceto
-   `TransferToHost3d` esperar leituras em voo esgotarem) mas a causa raiz exata não foi 100%
-   fechada — reduz drasticamente a frequência sem eliminar. Ver memória
-   `capivara-compose-loop-blocker` pro estado exato e hipóteses não confirmadas.
+6. **Último bloqueador conhecido, ainda não corrigido**: `SIGSEGV` em
+   `VirtioGpuResource::TransferWithIov`/`memmove`, host crasha entre ~7s e ~580s dependendo da sorte
+   do scheduler. Mitigado parcialmente do lado libkrun (patch 0010: `deferred_guard` serializa
+   leituras deferidas contra comandos inline) e do lado gfxstream (patch 0013: `mResources` virou
+   `map<id, shared_ptr<VirtioGpuResource>>` com mutex só nas operações de mapa, eliminando qualquer
+   use-after-free no nível do mapa) — ambos são correções estruturais reais e válidas, mas **o crash
+   persiste mesmo depois das duas**. Achado decisivo: os bytes corrompidos são **idênticos** entre
+   crashes de sessões diferentes (decodificam pra `"/tmp/capy-adb-5555.sock"`, string nossa) — isso
+   descarta race clássica (que produziria lixo variável) e aponta pra um **bug de lógica
+   determinístico** (provável `iovec` lido antes de ser anexado). Ver memória
+   `capivara-compose-loop-blocker` pro estado exato e o próximo passo concreto.
