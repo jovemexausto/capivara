@@ -427,9 +427,26 @@ fn boot(args: &Args) -> anyhow::Result<()> {
     info!("GPU: gfxstream Vulkan-only + external blob, 256 MiB vRAM");
 
     if !args.no_display {
-        // Display headless
-        let mut disp = Box::new(HeadlessDisplay::new());
-        let disp_ptr = &mut *disp as *mut HeadlessDisplay as *mut c_void;
+        // Display headless.
+        //
+        // libkrun retains `create_userdata` (the HeadlessDisplay pointer) for the
+        // lifetime of the VM and dereferences it later, from the GPU worker thread,
+        // every time the guest flushes a scanout (headless_create copies it into the
+        // display `instance`, then headless_alloc_frame reads `disp.frame_buf`). So
+        // the HeadlessDisplay must outlive this function. A plain `Box` local here
+        // is dropped when `setup` returns -- long before the VM runs -- leaving
+        // libkrun with a dangling pointer; its freed slot then gets reused (observed:
+        // by the CString just below at `vsock_path`), so `frame_buf.as_mut_ptr()`
+        // returns garbage and the first real scanout flush at compose time does a
+        // memcpy into a bogus address -> SIGSEGV in VirtioGpuResource::TransferWithIov.
+        // This crash only surfaced once the composer fixes (gfxstream 0011/0012) let
+        // compose actually reach scanout flush; the use-after-free was always here.
+        //
+        // Leak it: it must live for the whole process (the VM runs until
+        // krun_start_enter returns, after which the process exits), so a one-time
+        // intentional leak is the correct lifetime, not a scoped Box.
+        let disp: &'static mut HeadlessDisplay = Box::leak(Box::new(HeadlessDisplay::new()));
+        let disp_ptr = disp as *mut HeadlessDisplay as *mut c_void;
 
         let backend = krun_display_backend {
             features: KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER,
