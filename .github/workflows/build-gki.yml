@@ -42,8 +42,8 @@ jobs:
           sudo apt-get install -y python3 python3-dev build-essential git curl repo \
             bc flex bison libssl-dev libelf-dev
 
-          git config --global user.email "ci@capivara.dev"
-          git config --global user.name "Capivara CI"
+          git config --global user.email "figueiredo@protonmail.com"
+          git config --global user.name "Marcus Figueiredo"
 
       # /tmp/kernel é o checkout `repo sync` da árvore AOSP pinada em
       # patches/kernel/<android_version>/pinned-manifest.xml. Esse manifest fixa um SHA exato por
