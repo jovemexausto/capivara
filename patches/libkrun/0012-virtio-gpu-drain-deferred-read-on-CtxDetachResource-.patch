@@ -1,0 +1,52 @@
+From 01904838efdaf965fbb6b18163060d03aa2fd733 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Sun, 28 Jun 2026 04:14:19 -0300
+Subject: [PATCH] virtio/gpu: drain deferred read on CtxDetachResource to fix
+ pipe UAF
+
+A deferred TransferFromHost3d read runs lock-free on a one-shot "gpu xfer"
+thread (see the deferral added earlier). The deferred_guard already makes the
+resource-backing lifecycle commands wait_idle on the resource id, but
+CtxDetachResource was not covered. On the gfxstream side CtxDetachResource ->
+VirtioGpuResource::DetachFromContext sets mHostPipe = nullptr, dropping the last
+shared_ptr to the context's RenderThreadPipe and freeing its RenderChannel. If a
+deferred read on that resource is mid pipe->TransferFromHost at that moment it
+dereferences the freed channel.
+
+Observed as a host SIGSEGV at 0x0 in
+VirtioGpuRenderThreadPipe::TransferFromHost, reached via
+VirtioGpuResource::TransferRead -> transfer_read_blocking_by_id on the gpu xfer
+thread, during SurfaceFlinger/SystemUI composition.
+
+Add CtxDetachResource to the same per-resource wait_idle drain as
+attach/detach-backing/unref/create, so the detach (and the pipe free it
+triggers) cannot run while a deferred read on that resource is in flight.
+---
+ src/devices/src/virtio/gpu/worker.rs | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/src/devices/src/virtio/gpu/worker.rs b/src/devices/src/virtio/gpu/worker.rs
+index 4a263b4..fbc2f5a 100644
+--- a/src/devices/src/virtio/gpu/worker.rs
++++ b/src/devices/src/virtio/gpu/worker.rs
+@@ -697,6 +697,17 @@ impl Worker {
+                     deferred_guard::wait_idle(info.resource_id)
+                 }
+                 GpuCommand::ResourceUnref(info) => deferred_guard::wait_idle(info.resource_id),
++                // CtxDetachResource -> VirtioGpuResource::DetachFromContext sets
++                // mHostPipe = nullptr, dropping the last shared_ptr to the context's
++                // RenderThreadPipe and freeing its RenderChannel. A deferred
++                // TransferFromHost3d read on this resource, running lock-free on the
++                // "gpu xfer" thread, is mid pipe->TransferFromHost at that moment and
++                // would dereference the freed channel (observed: SIGSEGV at 0x0 in
++                // VirtioGpuRenderThreadPipe::TransferFromHost). Drain it first, exactly
++                // like the resource-backing commands above.
++                GpuCommand::CtxDetachResource(info) => {
++                    deferred_guard::wait_idle(info.resource_id)
++                }
+                 GpuCommand::ResourceCreate2d(info) => deferred_guard::wait_idle(info.resource_id),
+                 GpuCommand::ResourceCreate3d(info) => deferred_guard::wait_idle(info.resource_id),
+                 GpuCommand::ResourceCreateBlob(info) => {
+-- 
+2.53.0
+

@@ -1,0 +1,17 @@
+# Capivara boot fixes — imported by /system/etc/init/hw/init.rc via
+# `import /init.${ro.hardware}.rc` (ro.hardware=cf) in normal second-stage boot.
+#
+# frp by-name symlink + perms.
+# The frp partition is attached by capy as the 3rd virtio-blk disk (vdc), a raw
+# 4 MiB image with no GPT label, so ueventd never creates /dev/block/by-name/frp.
+# PersistentDataBlockService's init thread opens that path very early (~T=12s);
+# if the symlink is absent it fails with ENOENT, never signals init-done, and
+# onBootPhase(500) throws "init timeout" -> system_server FATAL -> crash-loop.
+# Creating it here in `on init` (long before system_server) wins the race.
+# /dev/block/vdc itself is root:root 0600 by default; PersistentDataBlockService
+# runs as uid system, so it also needs group system + 0660 on the real node
+# (the cutf_cvm ueventd perm rule does not apply: ro.hardware=cf, not cutf_cvm).
+on init
+    symlink /dev/block/vdc /dev/block/by-name/frp
+    chown root system /dev/block/vdc
+    chmod 0660 /dev/block/vdc

@@ -490,11 +490,11 @@ fn boot(args: &Args) -> anyhow::Result<()> {
         warn!("TPM solicitado via --tpm-socket, mas krun_set_tpm_socket não está disponível (sem impl FFI no libkrun vendorizado) — ignorando.");
     }
 
-    // vsock ADB
-    start_adb_bridge("/tmp/capy-adb-5555.sock", "127.0.0.1:5555")?;
-    let vsock_path = CString::new("/tmp/capy-adb-5555.sock").context("vsock path")?;
+    // vsock ADB — use 5556 to avoid conflict with BlueStacks/Genymotion on 5555
+    start_adb_bridge("/tmp/capy-adb-5556.sock", "127.0.0.1:5556")?;
+    let vsock_path = CString::new("/tmp/capy-adb-5556.sock").context("vsock path")?;
     krun_check!(krun_add_vsock_port2(ctx, 5555, vsock_path.as_ptr(), true));
-    info!("vsock: ADB port 5555 via /tmp/capy-adb-5555.sock and tcp 127.0.0.1:5555");
+    info!("vsock: ADB port 5556 via /tmp/capy-adb-5556.sock and tcp 127.0.0.1:5556");
 
     let console_path = CString::new("/tmp/capy-console.log").unwrap();
     krun_check!(krun_set_console_output(ctx, console_path.as_ptr()));

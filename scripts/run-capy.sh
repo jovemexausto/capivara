@@ -51,6 +51,6 @@ if [ ! -f "$REPO_ROOT/build/libkrunfw/libkrunfw.5.dylib" ]; then
 fi
 
 # O socket do bridge ADB é fixo; remove sobras de execuções anteriores para evitar EADDRINUSE.
-rm -f /tmp/capy-adb-5555.sock
+rm -f /tmp/capy-adb-5556.sock
 
 exec "$CAPY" "$@"

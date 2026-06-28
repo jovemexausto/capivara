@@ -1,0 +1,71 @@
+From 625345454e7356e46da518dbe9a4a1e51e3f6865 Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Sun, 28 Jun 2026 04:14:35 -0300
+Subject: [PATCH 14/15] host: hold a strong ref to the resource pipe across
+ blocking transfers
+
+ReadFromPipeToLinear/WriteToPipeFromLinear dereferenced the mHostPipe member
+directly across the (blocking) RenderThread transfer. A deferred
+TransferFromHost3d read runs on a separate thread; if the guest detaches the
+resource from its context concurrently, DetachFromContext sets mHostPipe =
+nullptr and frees the pipe (and its RenderChannel) out from under the in-flight
+read -> SIGSEGV in VirtioGpuRenderThreadPipe::TransferFromHost.
+
+Take a local shared_ptr copy and use it for the duration of the transfer so the
+pipe outlives the call regardless of a concurrent detach. WriteToPipeFromLinear
+already copied to a local but then still dereferenced the member; fix that too.
+(libkrun-side companion: drain the deferred read on CtxDetachResource.)
+---
+ host/virtio_gpu_resource.cpp | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/host/virtio_gpu_resource.cpp b/host/virtio_gpu_resource.cpp
+index 6a146442b..b52415b80 100644
+--- a/host/virtio_gpu_resource.cpp
++++ b/host/virtio_gpu_resource.cpp
+@@ -550,7 +550,13 @@ int VirtioGpuResource::ReadFromPipeToLinear(uint64_t offset, stream_renderer_box
+         return -EINVAL;
+     }
+ 
+-    if (!mHostPipe) {
++    // Hold a strong ref to the pipe for the duration of the (blocking) transfer.
++    // A deferred TransferFromHost3d read runs on a separate thread; if the guest
++    // detaches this resource from its context concurrently, DetachFromContext sets
++    // mHostPipe = nullptr and would otherwise free the pipe (and its RenderChannel)
++    // out from under this in-flight read -> SIGSEGV. The local copy keeps it alive.
++    auto hostPipe = mHostPipe;
++    if (!hostPipe) {
+         GFXSTREAM_ERROR("Failed to transfer: resource %d missing PIPE.", mId);
+         return -EINVAL;
+     }
+@@ -561,7 +567,7 @@ int VirtioGpuResource::ReadFromPipeToLinear(uint64_t offset, stream_renderer_box
+         return -EINVAL;
+     }
+ 
+-    return mHostPipe->TransferFromHost(mLinear.data() + box->x, box->w);
++    return hostPipe->TransferFromHost(mLinear.data() + box->x, box->w);
+ }
+ 
+ int VirtioGpuResource::WriteToPipeFromLinear(uint64_t offset, stream_renderer_box* box) {
+@@ -575,13 +581,16 @@ int VirtioGpuResource::WriteToPipeFromLinear(uint64_t offset, stream_renderer_bo
+         return -EINVAL;
+     }
+ 
++    // Strong ref for the duration of the transfer; see ReadFromPipeToLinear.
++    // (Previously this copied mHostPipe but then dereferenced the member directly,
++    // defeating the purpose.)
+     auto hostPipe = mHostPipe;
+-    if (!mHostPipe) {
++    if (!hostPipe) {
+         GFXSTREAM_ERROR("No hostPipe");
+         return -EINVAL;
+     }
+ 
+-    return mHostPipe->TransferToHost(mLinear.data() + box->x, box->w);
++    return hostPipe->TransferToHost(mLinear.data() + box->x, box->w);
+ }
+ 
+ int VirtioGpuResource::ReadFromBufferToLinear(uint64_t offset, stream_renderer_box* box) {
+-- 
+2.53.0
+

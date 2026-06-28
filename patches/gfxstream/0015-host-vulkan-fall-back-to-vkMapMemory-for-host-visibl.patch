@@ -1,0 +1,49 @@
+From 6b51643bb1734440bb28c9ece57263d5b063150a Mon Sep 17 00:00:00 2001
+From: Marcus Figueiredo <figueiredo@protonmail.com>
+Date: Sun, 28 Jun 2026 04:14:35 -0300
+Subject: [PATCH 15/15] host/vulkan: fall back to vkMapMemory for host-visible
+ blobs on Metal
+
+vkGetBlobInternal hard-aborted (GFXSTREAM_FATAL) when ExternalBlob was enabled
+and the macOS external-memory mode was Metal, because MoltenVK has no exportable
+external-memory handle under the Metal backend. The guest requests host-visible
+blobs constantly during SurfaceFlinger/gralloc composition, so this aborted the
+whole host process (Abort trap: 6) shortly into UI bring-up.
+
+Skip the unsupported ExternalBlob export branch on Apple+Metal and fall through
+to the existing vkMapMemory + addMapping path, which exposes MoltenVK's own
+host-visible pointer to the guest blob the same way the SHM path does.
+---
+ host/vulkan/vk_decoder_global_state.cpp | 14 +++++++++-----
+ 1 file changed, 9 insertions(+), 5 deletions(-)
+
+diff --git a/host/vulkan/vk_decoder_global_state.cpp b/host/vulkan/vk_decoder_global_state.cpp
+index 814bca622..fd16b960b 100644
+--- a/host/vulkan/vk_decoder_global_state.cpp
++++ b/host/vulkan/vk_decoder_global_state.cpp
+@@ -7117,13 +7117,17 @@ class VkDecoderGlobalState::Impl {
+             ExternalObjectManager::get()->addBlobDescriptorInfo(
+                 virtioGpuContextId, hostBlobId, info->sharedMemory->releaseHandle(),
+                 STREAM_HANDLE_TYPE_MEM_SHM, info->caching, std::nullopt);
+-        } else if (m_vkEmulation->getFeatures().ExternalBlob.enabled()) {
++        } else if (m_vkEmulation->getFeatures().ExternalBlob.enabled()
+ #ifdef __APPLE__
+-            if (m_vkEmulation->getExternalMemoryMode() == ExternalMemory::Mode::Metal) {
+-                GFXSTREAM_FATAL("ExternalBlob feature is not supported with external memory metal");
+-            }
++                   // MoltenVK has no exportable external-memory handle under the Metal
++                   // backend, so the ExternalBlob export path below cannot run. Rather
++                   // than abort (the guest requests host-visible blobs constantly during
++                   // SurfaceFlinger/gralloc composition), fall through to the plain
++                   // vkMapMemory + addMapping path, which exposes MoltenVK's own
++                   // host-visible pointer to the guest blob the same way the SHM path does.
++                   && m_vkEmulation->getExternalMemoryMode() != ExternalMemory::Mode::Metal
+ #endif
+-
++        ) {
+             struct VulkanInfo vulkanInfo = {
+                 .memoryIndex = info->memoryIndex,
+             };
+-- 
+2.53.0
+
