@@ -11,8 +11,9 @@ Android rodando nativamente em Apple Silicon macOS via HVF, `libkrun` e `gfxstre
 - ✅ SurfaceFlinger/composer3 estáveis ponta a ponta (`use_gles(true)` + `gralloc=minigbm`)
 - ✅ resolver o hang do blit GLES no macOS (Core profile; o bloqueador "composer/GLES" multi-sessão)
 - ✅ resolver o `postOnlyOnMainThread` sem UI thread (descartava toda composição em silêncio)
-- mitigar (não eliminado ainda) a race do deferred `TransferFromHost3d` vs. dispatch thread —
-  último bloqueador conhecido até `sys.boot_completed=1`; `oemlock`/`frp` contornados via workaround
+- ✅ `sys.boot_completed=1` alcançado (use-after-free do display backend + remoção do drain global
+  do deferred guard); `oemlock`/`frp` ainda contornados via workaround manual
+- integrar `oemlock` stub + partição `frp` ao boot (hoje aplicados via `adb` a cada boot)
 - garantir boot completo com scrcpy funcional
 - consolidar o fluxo de imagem, kernel e rootfs em scripts únicos
 - tornar o APK instalável e executável como `.app`
@@ -79,14 +80,16 @@ que aparecem durante o boot — cada um só fica visível depois que o anterior 
    `run_on_ui_thread` sempre caía no stub padrão que **descarta a tarefa em silêncio**. `compose()`
    ficava travado pra sempre em `completeFuture.wait()`. **Corrigido**: roda sempre na própria thread
    do `PostWorker`. Validado: `rcComposeWithoutPost` passou a entrar E retornar.
-6. **Último bloqueador conhecido, ainda não corrigido**: `SIGSEGV` em
-   `VirtioGpuResource::TransferWithIov`/`memmove`, host crasha entre ~7s e ~580s dependendo da sorte
-   do scheduler. Mitigado parcialmente do lado libkrun (patch 0010: `deferred_guard` serializa
-   leituras deferidas contra comandos inline) e do lado gfxstream (patch 0013: `mResources` virou
-   `map<id, shared_ptr<VirtioGpuResource>>` com mutex só nas operações de mapa, eliminando qualquer
-   use-after-free no nível do mapa) — ambos são correções estruturais reais e válidas, mas **o crash
-   persiste mesmo depois das duas**. Achado decisivo: os bytes corrompidos são **idênticos** entre
-   crashes de sessões diferentes (decodificam pra `"/tmp/capy-adb-5555.sock"`, string nossa) — isso
-   descarta race clássica (que produziria lixo variável) e aponta pra um **bug de lógica
-   determinístico** (provável `iovec` lido antes de ser anexado). Ver memória
-   `capivara-compose-loop-blocker` pro estado exato e o próximo passo concreto.
+6. **RESOLVIDO — era a causa raiz final**: `SIGSEGV` em `VirtioGpuResource::TransferWithIov`/`memmove`,
+   host crashava entre ~7s e ~580s. O achado decisivo: os bytes corrompidos eram **idênticos** entre
+   crashes de sessões diferentes (decodificavam pra `"/tmp/capy-adb-5555.sock"`, string nossa) — o que
+   descarta race (lixo variável) e aponta bug de lógica determinístico. Causa raiz: o `disp_ptr`
+   passado ao libkrun via FFI apontava pra um `Box<HeadlessDisplay>` **local** de `setup()` em
+   `crates/capy/src/main.rs`; quando `setup` retornava, o `Box` era dropado e o `frame_buf` de 33 MB
+   liberado, e a região era reusada pela `CString` do socket ADB — o gfxstream guardava o ponteiro e o
+   dereferenciava no flush de scanout do compose (só exercitado depois que 0011/0012 fizeram o compose
+   chegar ao flush, por isso só apareceu agora). Fix: `Box::leak` (ownership transferido pro libkrun
+   pelo tempo de vida do processo), monorepo `fe63c4a`. Os patches gfxstream 0013 e libkrun 0010
+   (`wait_idle`) continuam válidos como hardening estrutural, mas não eram a causa deste crash; o
+   `wait_idle_all()` global de 0010 foi **removido** (libkrun 0011) por causar deadlock no ring ASG.
+   **Resultado: `sys.boot_completed=1`, 35s de uptime, 0 watchdog kills.**
