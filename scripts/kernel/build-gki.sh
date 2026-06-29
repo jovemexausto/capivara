@@ -77,40 +77,44 @@ else
   exit 1
 fi
 
-# ── 3. merge do fragmento de Kconfig ────────────────────────────────────────────────────────────
-# merge_config -m só faz merge TEXTUAL: anexa as linhas do fragmento no fim do
-# gki_defconfig. Isso deixa o defconfig em forma NÃO-canônica (símbolos fora de
-# ordem, comentários, redundâncias). O Kleaf, no kernel_aarch64_config, roda
-# `savedefconfig` e exige que o gki_defconfig commitado JÁ esteja na forma minimal
-# que o savedefconfig produz — senão falha com
-# "savedefconfig does not match common/arch/arm64/configs/gki_defconfig".
+# ── 3. aplica o fragmento de Kconfig em forma CANÔNICA ──────────────────────────────────────────
+# Por que não merge_config.sh -m: ele faz merge TEXTUAL, anexando as linhas do
+# fragmento no fim do gki_defconfig. O Kleaf, no kernel_aarch64_config, roda
+# `savedefconfig` e exige que o gki_defconfig JÁ esteja na forma minimal/canônica
+# que o savedefconfig produz (símbolos nas posições certas, sem comentários) —
+# senão falha com "savedefconfig does not match ...gki_defconfig". E não dá pra
+# corrigir com `_config -- savedefconfig`: o check roda ao BUILDAR o target _config,
+# antes do subcomando executar (chicken-and-egg).
+#
+# Então inserimos cada símbolo na posição canônica que o savedefconfig emite (ordem
+# derivada do próprio diff do savedefconfig). Partimos de um gki_defconfig pristino
+# (git checkout) pra ser idempotente mesmo num checkout cacheado já modificado por
+# runs anteriores; a única mudança da patch 0001 no defconfig é remover ` bootconfig`
+# do CONFIG_CMDLINE, que o checkout reverteu e re-aplicamos aqui.
 DEFCONFIG="$KERNEL_COMMON/arch/arm64/configs/gki_defconfig"
-KCONFIG_CONFIG="$DEFCONFIG" "$KERNEL_COMMON/scripts/kconfig/merge_config.sh" -m \
-  "$DEFCONFIG" "$CONFIG_FRAGMENT"
+git -C "$KERNEL_COMMON" checkout -- arch/arm64/configs/gki_defconfig
+sed -i '/^CONFIG_CMDLINE=/s/ bootconfig"/"/' "$DEFCONFIG"
 
-# ── 3.5 normaliza o gki_defconfig via savedefconfig do próprio Kleaf ──────────────────────────────
-# Regenera o gki_defconfig na forma canônica (resolve a ordem/minimalização que o
-# check do kernel_aarch64_config exige). No Kleaf, savedefconfig é um SUBCOMANDO
-# do target _config (não um target próprio — `//common:kernel_aarch64_savedefconfig`
-# não existe); é o mesmo comando que a doc do GKI manda rodar quando dá
-# "savedefconfig does not match". Lê o defconfig mergeado acima, deriva o .config
-# e escreve o savedefconfig de volta no source tree, in-place.
-cd "$KERNEL_DIR"
-./tools/bazel run --config=local --lto=none //common:kernel_aarch64_config -- savedefconfig
+# Inserções nas posições canônicas (mesma ordem/lugar do savedefconfig). Âncoras são
+# linhas exatas do gki_defconfig base; se alguma sumir numa versão futura do GKI, o
+# símbolo não é inserido e o guard abaixo falha alto.
+sed -i '/^# CONFIG_DEVPORT is not set$/a CONFIG_TCG_TPM=y\nCONFIG_TCG_VIRTIO=y' "$DEFCONFIG"
+sed -i '/^CONFIG_DRM=y$/a CONFIG_DRM_VIRTIO_GPU=y' "$DEFCONFIG"
+sed -i '/^CONFIG_DMABUF_SYSFS_STATS=y$/i CONFIG_UDMABUF=y\nCONFIG_DMABUF_HEAPS=y' "$DEFCONFIG"
+sed -i '/^CONFIG_DMABUF_SYSFS_STATS=y$/a CONFIG_DMABUF_HEAPS_SYSTEM=y' "$DEFCONFIG"
+sed -i '/^CONFIG_VIRTIO_BALLOON=m$/a CONFIG_VIRTIO_MMIO=y' "$DEFCONFIG"
+sed -i '/^CONFIG_BUG_ON_DATA_CORRUPTION=y$/a CONFIG_CRYPTO_USER=y' "$DEFCONFIG"
 
-# Guard: o savedefconfig só mantém símbolos não-default. Se algum dos nossos não
-# sobreviveu (dependência não satisfeita, símbolo renomeado, etc.), o build dist
-# seguiria sem ele e o boot/codec regrediria silenciosamente — falha aqui.
-for sym in \
-  CONFIG_VIRTIO_MMIO=y CONFIG_TCG_VIRTIO=y CONFIG_DRM_VIRTIO_GPU=y \
-  CONFIG_DMABUF_HEAPS=y CONFIG_DMABUF_HEAPS_SYSTEM=y; do
+# Guard: todos os símbolos do Capivara presentes (pega âncora que sumiu / drift do GKI).
+for sym in $(grep -E '^CONFIG_' "$CONFIG_FRAGMENT"); do
   if ! grep -qx "$sym" "$DEFCONFIG"; then
-    echo "✗ $sym sumiu do gki_defconfig após savedefconfig — dependência não satisfeita?" >&2
-    echo "  defconfig atual:"; grep -iE "DMABUF|VIRTIO_MMIO|TCG_VIRTIO|VIRTIO_GPU" "$DEFCONFIG" >&2 || true
+    echo "✗ $sym ausente do gki_defconfig — âncora de inserção mudou no GKI? ajuste scripts/kernel/build-gki.sh" >&2
+    grep -iE "DMABUF|VIRTIO_MMIO|TCG_VIRTIO|VIRTIO_GPU|CRYPTO_USER" "$DEFCONFIG" >&2 || true
     exit 1
   fi
 done
-echo "✓ gki_defconfig normalizado; símbolos do Capivara presentes"
+echo "✓ gki_defconfig em forma canônica; símbolos do Capivara presentes"
+cd "$KERNEL_DIR"
 
 # ── 4. build via Bazel/Kleaf ────────────────────────────────────────────────────────────────────
 ./tools/bazel run --config=local --lto=none //common:kernel_aarch64_dist -- --destdir="$KERNEL_DIST_DIR/kernel"
