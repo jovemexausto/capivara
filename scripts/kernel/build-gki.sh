@@ -95,15 +95,26 @@ DEFCONFIG="$KERNEL_COMMON/arch/arm64/configs/gki_defconfig"
 git -C "$KERNEL_COMMON" checkout -- arch/arm64/configs/gki_defconfig
 sed -i '/^CONFIG_CMDLINE=/s/ bootconfig"/"/' "$DEFCONFIG"
 
-# Inserções nas posições canônicas (mesma ordem/lugar do savedefconfig). Âncoras são
-# linhas exatas do gki_defconfig base; se alguma sumir numa versão futura do GKI, o
-# símbolo não é inserido e o guard abaixo falha alto.
-sed -i '/^# CONFIG_DEVPORT is not set$/a CONFIG_TCG_TPM=y\nCONFIG_TCG_VIRTIO=y' "$DEFCONFIG"
-sed -i '/^CONFIG_DRM=y$/a CONFIG_DRM_VIRTIO_GPU=y' "$DEFCONFIG"
-sed -i '/^CONFIG_DMABUF_SYSFS_STATS=y$/i CONFIG_UDMABUF=y\nCONFIG_DMABUF_HEAPS=y' "$DEFCONFIG"
-sed -i '/^CONFIG_DMABUF_SYSFS_STATS=y$/a CONFIG_DMABUF_HEAPS_SYSTEM=y' "$DEFCONFIG"
-sed -i '/^CONFIG_VIRTIO_BALLOON=m$/a CONFIG_VIRTIO_MMIO=y' "$DEFCONFIG"
-sed -i '/^CONFIG_BUG_ON_DATA_CORRUPTION=y$/a CONFIG_CRYPTO_USER=y' "$DEFCONFIG"
+# Inserções nas posições canônicas (mesma ordem/lugar do savedefconfig).
+# IDEMPOTENTES: alguns símbolos (ex.: UDMABUF, DMABUF_HEAPS) já vêm no gki_defconfig
+# base do android16 — inserir de novo geraria duplicata ("reassigning to symbol")
+# e quebraria o check do savedefconfig. ins_* só insere se o símbolo ainda não
+# existir; se a âncora sumir numa versão futura do GKI, falha alto.
+ins_after()  { grep -qxF "$2" "$DEFCONFIG" && return 0
+  grep -qxF "$1" "$DEFCONFIG" || { echo "✗ âncora ausente p/ '$2': $1" >&2; exit 1; }
+  sed -i "/^$1\$/a $2" "$DEFCONFIG"; }
+ins_before() { grep -qxF "$2" "$DEFCONFIG" && return 0
+  grep -qxF "$1" "$DEFCONFIG" || { echo "✗ âncora ausente p/ '$2': $1" >&2; exit 1; }
+  sed -i "/^$1\$/i $2" "$DEFCONFIG"; }
+
+ins_after  "# CONFIG_DEVPORT is not set"     "CONFIG_TCG_TPM=y"
+ins_after  "CONFIG_TCG_TPM=y"                "CONFIG_TCG_VIRTIO=y"
+ins_after  "CONFIG_DRM=y"                    "CONFIG_DRM_VIRTIO_GPU=y"
+ins_before "CONFIG_DMABUF_SYSFS_STATS=y"     "CONFIG_DMABUF_HEAPS=y"
+ins_before "CONFIG_DMABUF_HEAPS=y"           "CONFIG_UDMABUF=y"
+ins_after  "CONFIG_DMABUF_SYSFS_STATS=y"     "CONFIG_DMABUF_HEAPS_SYSTEM=y"
+ins_after  "CONFIG_VIRTIO_BALLOON=m"         "CONFIG_VIRTIO_MMIO=y"
+ins_after  "CONFIG_BUG_ON_DATA_CORRUPTION=y" "CONFIG_CRYPTO_USER=y"
 
 # Guard: todos os símbolos do Capivara presentes (pega âncora que sumiu / drift do GKI).
 for sym in $(grep -E '^CONFIG_' "$CONFIG_FRAGMENT"); do
