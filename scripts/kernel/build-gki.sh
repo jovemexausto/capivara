@@ -90,10 +90,13 @@ KCONFIG_CONFIG="$DEFCONFIG" "$KERNEL_COMMON/scripts/kconfig/merge_config.sh" -m 
 
 # ── 3.5 normaliza o gki_defconfig via savedefconfig do próprio Kleaf ──────────────────────────────
 # Regenera o gki_defconfig na forma canônica (resolve a ordem/minimalização que o
-# check do kernel_aarch64_config exige). Lê o defconfig mergeado acima, deriva o
-# .config e escreve o savedefconfig de volta no source tree, in-place.
+# check do kernel_aarch64_config exige). No Kleaf, savedefconfig é um SUBCOMANDO
+# do target _config (não um target próprio — `//common:kernel_aarch64_savedefconfig`
+# não existe); é o mesmo comando que a doc do GKI manda rodar quando dá
+# "savedefconfig does not match". Lê o defconfig mergeado acima, deriva o .config
+# e escreve o savedefconfig de volta no source tree, in-place.
 cd "$KERNEL_DIR"
-./tools/bazel run --config=local --lto=none //common:kernel_aarch64_savedefconfig
+./tools/bazel run --config=local --lto=none //common:kernel_aarch64_config -- savedefconfig
 
 # Guard: o savedefconfig só mantém símbolos não-default. Se algum dos nossos não
 # sobreviveu (dependência não satisfeita, símbolo renomeado, etc.), o build dist
