@@ -335,9 +335,14 @@ unsafe extern "C" fn headless_present_frame(
     _: u32,
     _: *const krun_rect,
 ) -> i32 {
-    // descarta — SP-4 vai aqui fazer encode para scrcpy.
-    // Diagnóstico opcional (CAPY_DUMP_DIR): grava o scanout composto cru pra
-    // provar se o frame_buf recebe pixels reais.
+    // Aqui chega o frame composto do scanout primário (RGBA, ~11x/s). Hoje
+    // descartado. Caminho de produto (SP-4): apresentar o frame_buf numa janela
+    // nativa (CAMetalLayer/NSView) — NÃO encodar pra scrcpy. scrcpy/screenrecord
+    // dependem de display VIRTUAL, que o gfxstream não compõe (displays vêm do
+    // VMM no init, não do guest — limitação multi-display conhecida do gfxstream);
+    // o frame_buf é o readback que de fato funciona. Ver memória
+    // capivara-scrcpy-codec-kernel-blocker.
+    // Diagnóstico opcional (CAPY_DUMP_DIR): grava o scanout composto cru.
     if instance.is_null() {
         return 0;
     }
