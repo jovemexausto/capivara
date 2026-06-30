@@ -1,12 +1,12 @@
 #!/bin/bash
-# scripts/kernel/build-gki.sh — reproduz o build do GKI usado pelo Capivara (virtio-tpm)
+# scripts/kernel/build-gki.sh — reproduz o build do GKI usado pelo Capivara (virtio-mmio).
 #
-# Pipeline, em ordem: repo sync (revisão pinada da versão escolhida) → aplica patch do driver
-# virtio-tpm → merge do fragmento de Kconfig → build via Bazel/Kleaf → coleta e verifica os
-# artefatos.
+# Pipeline, em ordem: repo sync (revisão pinada da versão escolhida) → aplica patches da versão
+# (se houver) → aplica o fragmento de Kconfig em forma canônica → build via Bazel/Kleaf → coleta e
+# verifica os artefatos.
 #
-# Tudo que define O QUE muda (manifest pinado, patch) vive em patches/kernel/<versão>/; o
-# fragmento de Kconfig é compartilhado entre versões em patches/kernel/capivara_gki.config — este
+# Tudo que define O QUE muda (manifest pinado, patches opcionais) vive em patches/kernel/<versão>/;
+# o fragmento de Kconfig é compartilhado entre versões em patches/kernel/capivara_gki.config — este
 # script só orquestra. Ver patches/kernel/README.md.
 #
 # Uso: build-gki.sh <android-version> [artifacts-dir] [kernel-dir] [kernel-dist-dir]
@@ -27,7 +27,6 @@ REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PATCHES_DIR="$REPO_ROOT/patches/kernel"
 VERSION_DIR="$PATCHES_DIR/$ANDROID_VERSION"
 PINNED_MANIFEST="$VERSION_DIR/pinned-manifest.xml"
-PATCH="$VERSION_DIR/0001-add-tpm-virtio-driver.patch"
 CONFIG_FRAGMENT="$PATCHES_DIR/capivara_gki.config"
 
 if ! command -v repo >/dev/null 2>&1; then
@@ -39,7 +38,7 @@ if [ ! -d "$VERSION_DIR" ]; then
   echo "  Versões disponíveis: $(ls -d "$PATCHES_DIR"/android* 2>/dev/null | xargs -n1 basename | tr '\n' ' ')" >&2
   exit 1
 fi
-for f in "$PINNED_MANIFEST" "$PATCH" "$CONFIG_FRAGMENT"; do
+for f in "$PINNED_MANIFEST" "$CONFIG_FRAGMENT"; do
   if [ ! -f "$f" ]; then
     echo "✗ arquivo esperado não encontrado: $f" >&2
     exit 1
@@ -59,23 +58,25 @@ else
 fi
 repo sync -c -j"$(nproc)" -q --no-clone-bundle
 
-# ── 2. aplica o patch do driver virtio-tpm ──────────────────────────────────────────────────────
+# ── 2. aplica patches da versão (se houver) ─────────────────────────────────────────────────────
+# Hoje não há patch (o virtio-mmio vem só de Kconfig); o loop existe pra quando uma versão
+# precisar de patch de source. Idempotente: detecta patch já aplicado num $KERNEL_DIR cacheado.
 KERNEL_COMMON="$KERNEL_DIR/common"
 cd "$KERNEL_COMMON"
-
-# Idempotência: se o patch já foi aplicado (re-execução local contra um $KERNEL_DIR reaproveitado),
-# não falha.
-if git apply --check -p1 "$PATCH" 2>/dev/null; then
-  git apply -p1 "$PATCH"
-  echo "✓ Patch aplicado: $(basename "$PATCH")"
-elif git apply --reverse --check -p1 "$PATCH" 2>/dev/null; then
-  echo "✓ Patch já estava aplicado: $(basename "$PATCH")"
-else
-  echo "✗ Patch não aplica nem está aplicado — árvore divergiu da revisão pinada em" \
-       "patches/kernel/$ANDROID_VERSION/pinned-manifest.xml. Não vou tentar adivinhar; atualize o" \
-       "pin ou regenere o patch (ver patches/kernel/README.md)." >&2
-  exit 1
-fi
+shopt -s nullglob
+for PATCH in "$VERSION_DIR"/*.patch; do
+  if git apply --check -p1 "$PATCH" 2>/dev/null; then
+    git apply -p1 "$PATCH"
+    echo "✓ Patch aplicado: $(basename "$PATCH")"
+  elif git apply --reverse --check -p1 "$PATCH" 2>/dev/null; then
+    echo "✓ Patch já estava aplicado: $(basename "$PATCH")"
+  else
+    echo "✗ Patch não aplica nem está aplicado: $(basename "$PATCH") — árvore divergiu da revisão" \
+         "pinada em patches/kernel/$ANDROID_VERSION/pinned-manifest.xml (ver patches/kernel/README.md)." >&2
+    exit 1
+  fi
+done
+shopt -u nullglob
 
 # ── 3. aplica o fragmento de Kconfig em forma CANÔNICA ──────────────────────────────────────────
 # Por que não merge_config.sh -m: ele faz merge TEXTUAL, anexando as linhas do
@@ -89,10 +90,11 @@ fi
 # Então inserimos cada símbolo na posição canônica que o savedefconfig emite (ordem
 # derivada do próprio diff do savedefconfig). Partimos de um gki_defconfig pristino
 # (git checkout) pra ser idempotente mesmo num checkout cacheado já modificado por
-# runs anteriores; a única mudança da patch 0001 no defconfig é remover ` bootconfig`
-# do CONFIG_CMDLINE, que o checkout reverteu e re-aplicamos aqui.
+# runs anteriores.
 DEFCONFIG="$KERNEL_COMMON/arch/arm64/configs/gki_defconfig"
 git -C "$KERNEL_COMMON" checkout -- arch/arm64/configs/gki_defconfig
+# Remove ` bootconfig` do CONFIG_CMDLINE embutido: o Capivara não anexa bootconfig ao
+# initramfs e passa a própria cmdline; mantém o kernel alinhado com o que já bootava.
 sed -i '/^CONFIG_CMDLINE=/s/ bootconfig"/"/' "$DEFCONFIG"
 
 # Inserções nas posições canônicas (mesma ordem/lugar do savedefconfig).
@@ -107,8 +109,6 @@ ins_before() { grep -qxF "$2" "$DEFCONFIG" && return 0
   grep -qxF "$1" "$DEFCONFIG" || { echo "✗ âncora ausente p/ '$2': $1" >&2; exit 1; }
   sed -i "/^$1\$/i $2" "$DEFCONFIG"; }
 
-ins_after  "# CONFIG_DEVPORT is not set"     "CONFIG_TCG_TPM=y"
-ins_after  "CONFIG_TCG_TPM=y"                "CONFIG_TCG_VIRTIO=y"
 ins_after  "CONFIG_DRM=y"                    "CONFIG_DRM_VIRTIO_GPU=y"
 ins_before "CONFIG_DMABUF_SYSFS_STATS=y"     "CONFIG_DMABUF_HEAPS=y"
 ins_before "CONFIG_DMABUF_HEAPS=y"           "CONFIG_UDMABUF=y"
@@ -120,7 +120,7 @@ ins_after  "CONFIG_BUG_ON_DATA_CORRUPTION=y" "CONFIG_CRYPTO_USER=y"
 for sym in $(grep -E '^CONFIG_' "$CONFIG_FRAGMENT"); do
   if ! grep -qx "$sym" "$DEFCONFIG"; then
     echo "✗ $sym ausente do gki_defconfig — âncora de inserção mudou no GKI? ajuste scripts/kernel/build-gki.sh" >&2
-    grep -iE "DMABUF|VIRTIO_MMIO|TCG_VIRTIO|VIRTIO_GPU|CRYPTO_USER" "$DEFCONFIG" >&2 || true
+    grep -iE "DMABUF|VIRTIO_MMIO|VIRTIO_GPU|CRYPTO_USER" "$DEFCONFIG" >&2 || true
     exit 1
   fi
 done
@@ -150,12 +150,10 @@ while IFS= read -r ko; do
   cp "$ko" "$ARTIFACTS_DIR/$rel"
 done < <(find "$KERNEL_DIST_DIR" -name "*.ko" 2>/dev/null | sort)
 
-# tpm_virtio.ko é o ponto inteiro deste build. Se não aparecer em lugar nenhum dos artefatos
-# coletados, o patch ou o fragmento de config falharam silenciosamente em algum lugar antes do
-# build do Bazel terminar — isso não deve passar como build verde.
-if ! find "$ARTIFACTS_DIR" -name "tpm_virtio.ko" | grep -q .; then
-  echo "✗ tpm_virtio.ko não encontrado em nenhum artefato coletado — patch ou config do" \
-       "virtio-tpm não pegou." >&2
+# Sanidade: o Image tem de existir nos artefatos. Sem ele o build não serve pra nada (e indica
+# que algo falhou silenciosamente antes do dist), então não passa como build verde.
+if [ ! -f "$ARTIFACTS_DIR/Image" ]; then
+  echo "✗ Image não encontrado em $ARTIFACTS_DIR — o dist do Kleaf não produziu o kernel." >&2
   exit 1
 fi
 
